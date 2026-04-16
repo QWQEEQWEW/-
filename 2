@@ -1,0 +1,1350 @@
+import faulthandler
+
+faulthandler.enable()
+
+import sys
+import cv2
+import numpy as np
+import keyboard
+import mouse
+import json
+import os
+import time
+import math
+import ctypes
+from ctypes import wintypes
+import threading
+from collections import deque
+import pytesseract
+import win32gui
+import win32ui
+
+# === dxcam ===
+try:
+    import dxcam
+except ImportError:
+    print("⚠️ dxcam не установлен. Установите: pip install dxcam")
+    dxcam = None
+
+# === YOLO / torch ===
+try:
+    import torch
+    from ultralytics import YOLO
+except ImportError:
+    print("ВНИМАНИЕ: Библиотеки для нейросети (torch, ultralytics) не найдены. Режим 'ИИ' не будет работать.")
+    YOLO = None
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QWidget, QLabel, QCheckBox, QFrame,
+    QScrollArea, QRubberBand, QComboBox, QLineEdit, QSpinBox,
+    QRadioButton, QGroupBox, QDialog, QFileDialog
+)
+from PyQt6.QtCore import Qt, QTimer, QRect, QPoint, QPointF, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import (
+    QImage, QPixmap, QPainter, QPen, QColor, QPainterPath, QCursor, QFont
+)
+
+ctypes.windll.user32.SetProcessDPIAware()
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+STYLE_SHEET = """
+QMainWindow, QDialog, QWidget#MainCanvas { background-color: #0A0C0E; color: #D1D1D1; font-family: 'Segoe UI', sans-serif; font-size: 13px; }
+QGroupBox { border: 1px solid #2C3136; border-radius: 6px; margin-top: 5px; background-color: #1E1E1E; font-weight: 600; color: #C9A063; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+QScrollArea { border: none; background: #1E1E1E; }
+QWidget#ScrollContent { background-color: #1E1E1E; }
+QComboBox { background-color: #3A3A3A; border: 1px solid #555; border-radius: 4px; padding: 4px; color: #FFFFFF; min-width: 60px; }
+QComboBox:hover { border-color: #FFD700; }
+QLineEdit, QSpinBox { background-color: #3A3A3A; border: 1px solid #555; border-radius: 4px; padding: 4px; color: #FFFFFF; }
+QPushButton { background-color: #4A4A4A; border: 1px solid #555; border-radius: 4px; padding: 4px; color: #EEE; }
+QPushButton:hover { background-color: #5A5A5A; border-color: #FFD700; }
+QPushButton#ActionBtn { background-color: #1E1E1E; font-weight: bold; }
+QPushButton#DeleteBtn { background-color: #2D1414; border-color: #E74C3C; color: #FF7675; }
+QLabel { color: #CCCCCC; }
+"""
+
+PROFILES_DIR = "profiles"
+os.makedirs(PROFILES_DIR, exist_ok=True)
+
+
+# === Потокобезопасный буфер ===
+class ThreadSafeBuffer:
+    def __init__(self, max_size=2):
+        self._lock = threading.Lock()
+        self._buffer = deque(maxlen=max_size)
+
+    def put(self, item):
+        with self._lock:
+            self._buffer.append(item)
+
+    def get_latest(self):
+        with self._lock:
+            return self._buffer[-1] if self._buffer else None
+
+    def clear(self):
+        with self._lock:
+            self._buffer.clear()
+
+
+# --- Widgets ---
+
+class ActiveCombosWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: #1E1E1E; border: 1px solid #2C3136; border-radius: 6px;")
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        self.title_label = QLabel("Активные комбо")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setStyleSheet("font-weight: bold; font-size: 16px; color: #C9A063;")
+        main_layout.addWidget(self.title_label)
+        self.combos_layout = QVBoxLayout()
+        main_layout.addLayout(self.combos_layout)
+
+    def update_active_combos(self, active_combo_data_list):
+        while self.combos_layout.count():
+            item = self.combos_layout.takeAt(0)
+            if item.widget(): item.widget().setParent(None)
+        if not active_combo_data_list:
+            placeholder = QLabel("Нет активных комбо")
+            placeholder.setStyleSheet("color: #555555; font-style: italic;")
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.combos_layout.addWidget(placeholder)
+        else:
+            for data in active_combo_data_list:
+                self.combos_layout.addWidget(ActiveComboItemWidget(data))
+
+
+class ActiveComboItemWidget(QFrame):
+    def __init__(self, data, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: #2C2F33; border: 1px solid #444; border-radius: 4px;")
+        self.setFixedHeight(40)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 2, 8, 2)
+        self.combo_name = QLabel(data.get("name", "Комбо"))
+        self.combo_name.setStyleSheet("font-weight: bold; color: #00FF00;")
+        layout.addWidget(self.combo_name)
+        layout.addWidget(QLabel(f"Мана: {data.get('current_mana', 0)} / {data.get('required_mana', 0)}"))
+        cd_text, cd_color = ("Готов", "#00FF00") if data.get("cd_ready", False) else ("КД", "#FF7675")
+        l_cd = QLabel(cd_text)
+        l_cd.setStyleSheet(f"color: {cd_color};")
+        layout.addWidget(l_cd)
+        layout.addStretch()
+
+
+class SectionHeaderWidget(QWidget):
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 5, 0, 5)
+        h = QLabel(title)
+        h.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        h.setStyleSheet(
+            "background: #1E1E1E; border: 1px solid #2C3136; border-radius: 6px; font-weight: bold; color: #C9A063; padding: 5px;")
+        layout.addWidget(h)
+
+
+# === ScreenGrabber ===
+class ScreenGrabber(QThread):
+    def __init__(self, mw):
+        super().__init__()
+        self.mw, self.running = mw, True
+        self._lock = threading.Lock()
+        self._last_frame = None
+        self.camera = None
+        self._init_dxcam()
+
+    def _init_dxcam(self):
+        if dxcam is None:
+            print("[⚠️] dxcam не установлен, захват отключён")
+            return
+        try:
+            self.camera = dxcam.create(device_idx=0, output_idx=0, output_color="BGR")
+            self.camera.start(target_fps=0)
+            print(f"[✓] dxcam запущен в BGR (макс. FPS)")
+        except Exception as e:
+            print(f"[❌] Ошибка инициализации dxcam: {e}")
+            try:
+                self.camera = dxcam.create(device_idx=0, output_idx=0)
+                self.camera.start(target_fps=0)
+                print(f"[✓] dxcam запущен (fallback)")
+            except Exception as e2:
+                print(f"[❌] Не удалось запустить dxcam: {e2}")
+                self.camera = None
+
+    def run(self):
+        while self.running:
+            if self.camera is None:
+                time.sleep(0.001)
+                continue
+            try:
+                frame = self.camera.get_latest_frame()
+                if frame is not None:
+                    with self._lock:
+                        self._last_frame = frame
+            except Exception as e:
+                print(f"[⚠️] Ошибка захвата: {e}")
+                time.sleep(0.01)
+            time.sleep(0)
+
+    def grab_bgr(self, rect: QRect, ratio: float) -> np.ndarray | None:
+        with self._lock:
+            base = self._last_frame
+            if base is None:
+                return None
+            x1 = int(max(0, rect.left() * ratio))
+            y1 = int(max(0, rect.top() * ratio))
+            x2 = int(min(base.shape[1], (rect.left() + rect.width()) * ratio))
+            y2 = int(min(base.shape[0], (rect.top() + rect.height()) * ratio))
+            if x2 <= x1 or y2 <= y1:
+                return None
+            return base[y1:y2, x1:x2].copy()
+
+    def stop(self):
+        self.running = False
+        if self.camera:
+            try:
+                self.camera.stop()
+            except:
+                pass
+
+
+class ZoneState:
+    def __init__(self):
+        self._lock, self._zones, self._target_pos, self._ts, self._ver = threading.Lock(), {}, None, 0.0, 0
+
+    def update(self, target_pos, zones_dict):
+        with self._lock:
+            self._target_pos = list(target_pos) if target_pos else None
+            self._zones = dict(zones_dict)
+            self._ts = time.monotonic()
+            self._ver += 1
+
+    def snapshot(self):
+        with self._lock:
+            return self._ver, (self._target_pos.copy() if self._target_pos else None), self._zones.copy(), self._ts
+
+
+class HotkeyButton(QPushButton):
+    def __init__(self, def_key, parent=None):
+        super().__init__(parent)
+        self.key, self.k_hook, self.m_hook = def_key, None, None
+        self.setText(self.key.upper())
+        self.setFixedWidth(60)
+        self.clicked.connect(self.start_recording)
+
+    def start_recording(self):
+        self.setText("???")
+        self.k_hook = keyboard.on_press(self.save_key)
+        self.m_hook = mouse.on_button(self.save_mouse, buttons=(mouse.X, mouse.X2), types=(mouse.DOWN,))
+
+    def save_key(self, e):
+        self.finalize_recording(e.name)
+
+    def save_mouse(self):
+        self.finalize_recording("x" if mouse.is_pressed(mouse.X) else "x2")
+
+    def finalize_recording(self, kn):
+        self.key = kn
+        self.setText(kn.upper())
+        try:
+            if self.k_hook: keyboard.unhook(self.k_hook)
+        except:
+            pass
+        try:
+            if self.m_hook: mouse.unhook(self.m_hook)
+        except:
+            pass
+        self.k_hook = self.m_hook = None
+
+
+class SkillWidget(QFrame):
+    def __init__(self, skill_id, mw, data=None):
+        super().__init__()
+        self.mw, self.skill_id = mw, skill_id
+        self.is_target_in, self.is_ready, self.match_val = False, True, 0.0
+        self.ready_img, self.region, self._img_lock = None, None, threading.Lock()
+        self.off_x, self.off_y = (data.get('off_x', 0), data.get('off_y', 50)) if data else (0, 50)
+        self.points = data.get('points',
+                               [[-100, -50], [100, -50], [100, 50], [-100, 50], [-100, -50], [-100, -50],
+                                [-100, -50], [-100, -50]]) if data else [[-100, -50], [100, -50], [100, 50], [-100, 50],
+                                                                         [-100, -50], [-100, -50], [-100, -50],
+                                                                         [-100, -50]]
+        if data and data.get('region'):
+            r = data['region']
+            self.region = QRect(r[0], r[1], r[2], r[3])
+        self.setFixedSize(210, 70)
+        self.setStyleSheet("background:#1E1E1E; border:1px solid #2C3136; border-radius:6px;")
+        main = QVBoxLayout(self)
+        main.setContentsMargins(4, 3, 4, 3)
+        main.setSpacing(2)
+        row1 = QHBoxLayout()
+        self.title = QLabel(f"#{skill_id}")
+        self.title.setStyleSheet("color:#FFD700; font-weight:bold;")
+        row1.addWidget(self.title)
+        row1.addWidget(QLabel("M:"))
+        self.mana_cost = QSpinBox()
+        self.mana_cost.setRange(0, 2000)
+        self.mana_cost.setFixedWidth(45)
+        if data: self.mana_cost.setValue(data.get('mana_cost', 0))
+        row1.addWidget(self.mana_cost)
+        self.edit_key = QLineEdit(data.get('key', 'q') if data else 'q')
+        self.edit_key.setFixedWidth(25)
+        row1.addWidget(self.edit_key)
+        self.check_show, self.check_edit = QCheckBox("👁"), QCheckBox("✍")
+        self.check_edit.toggled.connect(self.sync_edit_mode)
+        row1.addWidget(self.check_show)
+        row1.addWidget(self.check_edit)
+        main.addLayout(row1)
+        row2 = QHBoxLayout()
+        btn_reg, btn_snap = QPushButton("R"), QPushButton("📸")
+        btn_reg.setFixedSize(24, 20)
+        btn_reg.clicked.connect(lambda: self.mw.capture_region(self))
+        btn_snap.setFixedSize(24, 20)
+        btn_snap.clicked.connect(self.take_snapshot)
+        row2.addWidget(btn_reg)
+        row2.addWidget(btn_snap)
+        self.snap_view = QLabel()
+        self.snap_view.setFixedSize(32, 20)
+        self.snap_view.setStyleSheet("background:#000;")
+        row2.addWidget(self.snap_view)
+        self.match_label, self.status_label = QLabel("0%"), QLabel("OK")
+        row2.addWidget(self.match_label)
+        row2.addWidget(self.status_label)
+        main.addLayout(row2)
+
+    def take_snapshot(self):
+        if not self.region: return
+        bgr = self.mw.grabber.grab_bgr(self.region, self.mw.devicePixelRatio())
+        if bgr is None: return
+        with self._img_lock:
+            self.ready_img = bgr
+        self.snap_view.setPixmap(QPixmap.fromImage(
+            QImage(bgr.data, bgr.shape[1], bgr.shape[0], bgr.shape[1] * 3, QImage.Format.Format_BGR888)).scaled(32, 20))
+
+    def get_ready_img_copy(self):
+        with self._img_lock:
+            return self.ready_img.copy() if self.ready_img is not None else None
+
+    def sync_edit_mode(self, checked):
+        if checked:
+            with self.mw.skills_lock:
+                for s in self.mw.skills:
+                    if s != self: s.check_edit.setChecked(False)
+            self.mw.overlay.set_interactivity(self, True)
+        else:
+            self.mw.overlay.set_interactivity(None, False)
+
+    def apply_cd_ui(self, is_ready: bool, match_val: float):
+        self.is_ready = is_ready
+        self.status_label.setText("OK" if is_ready else "CD")
+        self.status_label.setStyleSheet(f"color:{'#00FF00' if is_ready else '#FF5555'}; font-size:9px;")
+        self.match_label.setText(f"{int(match_val * 100)}%")
+
+
+class ComboRow(QFrame):
+    def __init__(self, mw, data=None):
+        super().__init__()
+        self.mw, self.steps = mw, data.get('steps', []) if data else []
+        self.setFixedHeight(37)
+        self.setStyleSheet("background: #1E1E1E; border: 1px solid #2C3136; border-radius: 4px;")
+        l = QHBoxLayout(self)
+        l.setContentsMargins(4, 2, 4, 2)
+        self.trigger_mode = QComboBox()
+        self.trigger_mode.addItems(["Hold", "Toggle"])
+        self.trigger_mode.setFixedWidth(70)
+        l.addWidget(self.trigger_mode)
+        self.btn_key = HotkeyButton(data.get('key', 'x') if data else 'x')
+        l.addWidget(self.btn_key)
+        self.chk_tracking = QCheckBox("Слеж.")
+        l.addWidget(self.chk_tracking)
+        self.condition_mode = QComboBox()
+        self.condition_mode.addItems(["Без условий", "Ренж 1-го", "Ренж любого"])
+        self.condition_mode.setFixedWidth(90)
+        l.addWidget(self.condition_mode)
+        btn_edit = QPushButton("⚙")
+        btn_edit.setFixedSize(30, 30)
+        btn_edit.clicked.connect(self.open_editor)
+        l.addWidget(btn_edit)
+        btn_del = QPushButton("✕")
+        btn_del.setObjectName("DeleteBtn")
+        btn_del.setFixedSize(22, 22)
+        btn_del.clicked.connect(lambda: self.deleteLater())
+        l.addWidget(btn_del)
+        if data:
+            self.trigger_mode.setCurrentText(data.get('trigger', "Hold"))
+            self.condition_mode.setCurrentText(data.get('cond', "Без условий"))
+            self.chk_tracking.setChecked(data.get('tracking', False))
+
+    def open_editor(self):
+        dlg = RotationEditor(self.mw, self.steps)
+        if dlg.exec(): self.steps = dlg.get_data()
+
+
+class RotationEditor(QDialog):
+    def __init__(self, parent, steps_data):
+        super().__init__(parent)
+        self.setWindowTitle("Редактор цепочки")
+        self.setMinimumSize(900, 550)
+        self.mw = parent
+        self.setStyleSheet(STYLE_SHEET)
+        layout = QVBoxLayout(self)
+        self.scroll = QScrollArea()
+        self.container = QWidget()
+        self.container.setObjectName("ScrollContent")
+        self.steps_layout = QVBoxLayout(self.container)
+        self.steps_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.steps_layout.setSpacing(4)
+        self.scroll.setWidget(self.container)
+        self.scroll.setWidgetResizable(True)
+        layout.addWidget(self.scroll)
+        hint = QLabel("💡 Галочка '🚫 Слеж.' отключает обновление таргета на этом шаге")
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        btn_add = QPushButton("+ ДОБАВИТЬ ШАГ")
+        btn_add.setObjectName("ActionBtn")
+        btn_add.clicked.connect(lambda: self.add_step_ui())
+        layout.addWidget(btn_add)
+        btn_save = QPushButton("ПРИМЕНИТЬ")
+        btn_save.clicked.connect(self.accept)
+        layout.addWidget(btn_save)
+        for s in steps_data: self.add_step_ui(s)
+
+    def add_step_ui(self, data=None):
+        frame = QFrame()
+        frame.setFixedHeight(52)
+        frame.setStyleSheet("background: #0F1113; border: 1px solid #2C3136;")
+        l = QHBoxLayout(frame)
+        l.setContentsMargins(6, 4, 6, 4)
+        l.setSpacing(6)
+        sk_cb = QComboBox()
+        sk_cb.setFixedWidth(90)
+        with self.mw.skills_lock:
+            for i in range(len(self.mw.skills)): sk_cb.addItem(f"Скилл #{i + 1}")
+        act_cb = QComboBox()
+        act_cb.addItems(["⌨ Нажать клавишу", "🎯 Довести до края"])
+        act_cb.setFixedWidth(150)
+        delay = QSpinBox()
+        delay.setRange(0, 5000)
+        delay.setSuffix(" ms")
+        delay.setFixedWidth(80)
+        chk_rng, chk_can, chk_lock = QCheckBox("R"), QCheckBox("C"), QCheckBox("L")
+        cw = QSpinBox()
+        cw.setRange(0, 5000)
+        cw.setValue(120)
+        cw.setSuffix(" ms")
+        cw.setFixedWidth(80)
+        cr = QSpinBox()
+        cr.setRange(1, 1000)
+        cr.setValue(50)
+        cr.setSuffix(" px")
+        cr.setFixedWidth(80)
+        chk_no_track = QCheckBox("🚫 Слеж.")
+        chk_no_track.setToolTip("Отключить обновление таргета на этом шаге")
+        chk_no_track.setFixedWidth(70)
+        if data:
+            sk_cb.setCurrentIndex(data.get('skill_idx', 0))
+            act_cb.setCurrentText(data.get('action', "⌨ Нажать клавишу"))
+            delay.setValue(data.get('delay', 0))
+            chk_rng.setChecked(data.get('use_range', False))
+            chk_can.setChecked(data.get('can_cancel', False))
+            chk_lock.setChecked(data.get('lock_pos', False))
+            cw.setValue(data.get('cancel_window_ms', 120))
+            cr.setValue(data.get('cancel_range_px', 50))
+            chk_no_track.setChecked(data.get('disable_tracking', False))
+        btn_del = QPushButton("✕")
+        btn_del.setObjectName("DeleteBtn")
+        btn_del.setFixedSize(24, 24)
+        btn_del.clicked.connect(lambda: frame.deleteLater())
+        l.addWidget(sk_cb)
+        l.addWidget(act_cb)
+        l.addWidget(delay)
+        l.addWidget(chk_rng)
+        l.addWidget(chk_can)
+        l.addWidget(chk_lock)
+        l.addWidget(QLabel("CW:"))
+        l.addWidget(cw)
+        l.addWidget(QLabel("CR:"))
+        l.addWidget(cr)
+        l.addWidget(chk_no_track)
+        l.addStretch()
+        l.addWidget(btn_del)
+        self.steps_layout.addWidget(frame)
+
+    def get_data(self):
+        res = []
+        for i in range(self.steps_layout.count()):
+            w = self.steps_layout.itemAt(i).widget()
+            if w:
+                cbs = w.findChildren(QComboBox)
+                chks = w.findChildren(QCheckBox)
+                spins = w.findChildren(QSpinBox)
+                res.append({
+                    'skill_idx': cbs[0].currentIndex(),
+                    'action': cbs[1].currentText(),
+                    'delay': spins[0].value(),
+                    'use_range': chks[0].isChecked(),
+                    'can_cancel': chks[1].isChecked(),
+                    'lock_pos': chks[2].isChecked(),
+                    'cancel_window_ms': spins[1].value(),
+                    'cancel_range_px': spins[2].value(),
+                    'disable_tracking': chks[3].isChecked()
+                })
+        return res
+
+
+# --- Logic Threads ---
+
+class ZoneTrackerThread(QThread):
+    def __init__(self, mw):
+        super().__init__()
+        self.mw, self.running, self.zone_state = mw, True, ZoneState()
+
+    def run(self):
+        while self.running:
+            if not self.mw.is_active:
+                time.sleep(0.001)
+                continue
+            tracking_disabled = getattr(self.mw, '_tracking_disabled', False)
+            t_pos = None
+            if self.mw.mode_cursor.isChecked():
+                cp = QCursor.pos()
+                t_pos = [cp.x(), cp.y()]
+            elif not tracking_disabled and hasattr(self.mw, 'detector'):
+                # 🔧 Читаем из атомарного снэпшота
+                snapshot = getattr(self.mw.detector, '_latest_snapshot', None)
+                if snapshot and (time.perf_counter() - snapshot['ts'] < 0.15) and snapshot['target']:
+                    t_pos = snapshot['target'].copy()
+            sc = self.mw.overlay.screen().geometry().center()
+            zones = {}
+            with self.mw.skills_lock:
+                for idx, sk in enumerate(self.mw.skills):
+                    zones[idx] = self.check_point_in_polygon(t_pos, sk, sc) if t_pos and sk.points else False
+                    sk.is_target_in = zones[idx]
+            self.zone_state.update(t_pos, zones)
+            time.sleep(0.0005)
+
+    def check_point_in_polygon(self, pt, sk, sc):
+        if not pt: return False
+        cx, cy, n, inside = sc.x() + sk.off_x, sc.y() + sk.off_y, len(sk.points), False
+        j = n - 1
+        for i in range(n):
+            xi, yi = cx + sk.points[i][0], cy + sk.points[i][1]
+            xj, yj = cx + sk.points[j][0], cy + sk.points[j][1]
+            if ((yi > pt[1]) != (yj > pt[1])) and (
+                    pt[0] < (xj - xi) * (pt[1] - yi) / ((yj - yi) if (yj - yi) != 0 else 1e-9) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+
+class LogicThread(QThread):
+    def __init__(self, mw, zone_tracker):
+        super().__init__()
+        self.mw, self.zone_tracker, self.running = mw, zone_tracker, True
+        self.cur_mana, self.mana_updated, self.combo_states = 0, False, {}
+        self.tracking_active = False
+
+    def is_bind_pressed(self, key):
+        k = key.lower()
+        if k == "x": return (ctypes.windll.user32.GetAsyncKeyState(0x05) & 0x8000) != 0
+        if k == "x2": return (ctypes.windll.user32.GetAsyncKeyState(0x06) & 0x8000) != 0
+        try:
+            return keyboard.is_pressed(k)
+        except:
+            return False
+
+    def run(self):
+        while self.running:
+            if not self.mw.is_active: self.msleep(10); continue
+            combos = self.mw.findChildren(ComboRow)
+            self.tracking_active = any(self.is_bind_pressed(row.btn_key.key) for row in combos)
+
+            for row in combos:
+                rid = id(row)
+                if rid not in self.combo_states: self.combo_states[rid] = {"was_p": False, "tgl": False,
+                                                                           "running": False}
+                st = self.combo_states[rid]
+                is_p = self.is_bind_pressed(row.btn_key.key)
+                if st["running"]: continue
+                if row.trigger_mode.currentText() == "Hold" and is_p:
+                    st["running"] = True
+                    self.execute_combo(row)
+                    st["running"] = False
+                elif row.trigger_mode.currentText() == "Toggle":
+                    if is_p and not st["was_p"]: st["tgl"] = not st["tgl"]
+                    if st["tgl"]:
+                        st["running"] = True
+                        res = self.execute_combo(row)
+                        if res in ["STOP", "FAIL", "NO_TARGET"]: st["tgl"] = False
+                        st["running"] = False
+                st["was_p"] = is_p
+            self.msleep(1)
+
+    def execute_combo(self, row):
+        steps = list(row.steps)
+        if not steps: return "FAIL"
+        _, pos, zones, _ = self.zone_tracker.zone_state.snapshot()
+        if not pos: return "NO_TARGET"
+        if row.chk_tracking.isChecked() and not getattr(self.mw, '_tracking_disabled', False):
+            mouse.move(int(pos[0]), int(pos[1]), absolute=True)
+        cond = row.condition_mode.currentText()
+        if cond == "Ренж 1-го" and not zones.get(steps[0]['skill_idx'], False): return "OUT"
+        if cond == "Ренж любого" and not any(zones.get(s['skill_idx'], False) for s in steps): return "OUT"
+        lock_pos = None
+        for step_idx, s in enumerate(steps):
+            if row.trigger_mode.currentText() == "Hold" and not self.is_bind_pressed(row.btn_key.key): return "STOP"
+            idx = s['skill_idx']
+            with self.mw.skills_lock:
+                if idx >= len(self.mw.skills): continue
+                sk = self.mw.skills[idx]
+            _, live_p, live_zones, _ = self.zone_tracker.zone_state.snapshot()
+            cur_p = live_p if live_p else pos
+            if s.get('use_range') and not live_zones.get(idx): return "OUT"
+            if s.get('disable_tracking', False):
+                self.mw._tracking_disabled = True
+            if s['action'] == "🎯 Довести до края":
+                sc = self.mw.overlay.screen().geometry().center()
+                pivot = [sc.x() + sk.off_x, sc.y() + sk.off_y]
+                aim = lock_pos if (lock_pos or s.get('disable_tracking', False)) else cur_p
+                res = self.mw.intersect_ray_polygon(pivot, aim, sk.points)
+                mouse.move(int(res[0]), int(res[1]), absolute=True)
+            else:
+                if s.get('lock_pos') and cur_p: lock_pos = list(cur_p)
+                keyboard.press_and_release(sk.edit_key.text().lower())
+            delay = s['delay']
+            if delay > 0:
+                start_t = time.time()
+                while (time.time() - start_t) * 1000 < delay:
+                    if row.trigger_mode.currentText() == "Hold" and not self.is_bind_pressed(row.btn_key.key):
+                        if s.get('disable_tracking', False): self.mw._tracking_disabled = False
+                        return "STOP"
+                    if s.get('can_cancel'):
+                        elapsed = (time.time() - start_t) * 1000
+                        if elapsed <= s.get('cancel_window_ms', 120):
+                            if not s.get('disable_tracking', False):
+                                cursor = QCursor.pos()
+                                # 🔧 Читаем из снэпшота
+                                snapshot = getattr(self.mw.detector, '_latest_snapshot', None)
+                                if snapshot and (time.perf_counter() - snapshot['ts'] < 0.1) and snapshot['target']:
+                                    target = snapshot['target']
+                                    dist = math.hypot(cursor.x() - target[0], cursor.y() - target[1])
+                                    if dist > s.get('cancel_range_px', 50):
+                                        keyboard.press_and_release('s')
+                                        if s.get('disable_tracking', False): self.mw._tracking_disabled = False
+                                        return "CANCELLED"
+                    time.sleep(0.001)
+            if s.get('disable_tracking', False):
+                next_step_disables = (step_idx + 1 < len(steps) and steps[step_idx + 1].get('disable_tracking', False))
+                if not next_step_disables: self.mw._tracking_disabled = False
+        self.mw._tracking_disabled = False
+        return "OK"
+
+
+# 🔧 DetectorThread с единым атомарным снэпшотом для ВСЕХ читателей
+class DetectorThread(QThread):
+    coords_updated = pyqtSignal(list, float)
+
+    def __init__(self, mw):
+        super().__init__()
+        self.mw = mw
+        self.running = True
+        self.model = None
+        self.device = 'cuda' if YOLO and torch.cuda.is_available() else 'cpu'
+        self.debug_buffer = ThreadSafeBuffer(max_size=2)
+        self.target_point = None
+        self.target_timestamp = 0.0
+        self._coord_lock = threading.Lock()
+        self.fps_counter = 0
+        self.last_fps_time = time.time()
+        self.current_fps = 0
+        self.all_detections = []
+        self.alpha = 0.35
+        self.locked_center = None
+        self.track_radius = 120
+        self._model_lock = threading.Lock()
+        # 🔧 ЕДИНЫЙ снэпшот для оверлея, дебаг-рендера и логики
+        self._latest_snapshot = {
+            'target': None,
+            'ts': 0.0,
+            'detections': [],
+            'version': 0  # монотонный счётчик для проверки актуальности
+        }
+
+    def run(self):
+        while self.running:
+            try:
+                capture_rect = self.mw.overlay.screen().geometry()
+                ratio = self.mw.devicePixelRatio()
+                full_frame = self.mw.grabber.grab_bgr(capture_rect, ratio)
+
+                if full_frame is None or full_frame.size == 0:
+                    continue
+
+                h, w = full_frame.shape[:2]
+                if w == 0 or h == 0:
+                    continue
+
+                scale = self.mw.nn_imgsz / w
+                new_h = int(h * scale)
+                inference_frame = cv2.resize(full_frame, (self.mw.nn_imgsz, new_h), interpolation=cv2.INTER_LINEAR)
+
+                detections = []
+                cursor = QCursor.pos()
+                raw_center = None
+
+                if self.mw.mode_ai.isChecked() and YOLO and self.mw.e_nn_model_path.text():
+                    m_path = self.mw.e_nn_model_path.text()
+                    if not self.model or getattr(self.model, 'pt_path', '') != m_path:
+                        try:
+                            with self._model_lock:
+                                self.model = YOLO(m_path).to(self.device)
+                                self.model.pt_path = m_path
+                        except Exception as e:
+                            print(f"[❌] Ошибка загрузки модели: {e}")
+                            self.model = None
+                            time.sleep(0.2)
+                            continue
+
+                    if self.model:
+                        conf = self.mw.s_nn_conf.value() / 100.0
+                        try:
+                            with torch.inference_mode():
+                                results = self.model(inference_frame, verbose=False, conf=conf, device=self.device)
+                            if results and results[0].boxes is not None:
+                                boxes = results[0].boxes.xyxy.cpu().numpy()
+                                confs = results[0].boxes.conf.cpu().numpy()
+                                for i, (x1, y1, x2, y2) in enumerate(boxes):
+                                    x1_g = capture_rect.left() + (x1 / scale) / ratio
+                                    y1_g = capture_rect.top() + (y1 / scale) / ratio
+                                    x2_g = capture_rect.left() + (x2 / scale) / ratio
+                                    y2_g = capture_rect.top() + (y2 / scale) / ratio
+                                    detections.append({
+                                        'center': ((x1_g + x2_g) / 2, (y1_g + y2_g) / 2),
+                                        'bbox': (x1_g, y1_g, x2_g, y2_g),
+                                        'conf': float(confs[i]),
+                                        'bbox_local': (int(x1), int(y1), int(x2), int(y2))
+                                    })
+                        except Exception as e:
+                            err_str = str(e).lower()
+                            if "cuda" in err_str or "access" in err_str:
+                                print(f"[⚠️] GPU/Access ошибка: {e}")
+                                torch.cuda.empty_cache()
+                                self.model = None
+                            time.sleep(0.005)
+
+                tracking_engaged = getattr(self.mw.logic, 'tracking_active', False)
+                if tracking_engaged:
+                    if self.locked_center is None:
+                        best = min(detections,
+                                   key=lambda d: math.hypot(d['center'][0] - cursor.x(), d['center'][1] - cursor.y()),
+                                   default=None)
+                        if best: self.locked_center, raw_center = best['center'], best['center']
+                    else:
+                        best = min(detections, key=lambda d: math.hypot(d['center'][0] - self.locked_center[0],
+                                                                        d['center'][1] - self.locked_center[1]),
+                                   default=None)
+                        if best and math.hypot(best['center'][0] - self.locked_center[0],
+                                               best['center'][1] - self.locked_center[1]) < self.track_radius:
+                            cx, cy = best['center']
+                            self.locked_center = (self.alpha * cx + (1.0 - self.alpha) * self.locked_center[0],
+                                                  self.alpha * cy + (1.0 - self.alpha) * self.locked_center[1])
+                            raw_center = self.locked_center
+                        else:
+                            raw_center = self.locked_center
+                else:
+                    self.locked_center = None
+                    best = min(detections,
+                               key=lambda d: math.hypot(d['center'][0] - cursor.x(), d['center'][1] - cursor.y()),
+                               default=None)
+                    if best: raw_center = best['center']
+
+                target_point = [raw_center[0] + self.mw.s_nn_offset_x.value(),
+                                raw_center[1] + self.mw.s_nn_offset_y.value()] if raw_center else None
+                ts = time.perf_counter()
+
+                # 🔧 АТОМАРНОЕ обновление: всё в одной блокировке
+                with self._coord_lock:
+                    self.target_point = target_point
+                    self.target_timestamp = ts
+                    self.all_detections = detections
+                    # Обновляем снэпшот с инкрементом версии
+                    self._latest_snapshot = {
+                        'target': target_point.copy() if target_point else None,
+                        'ts': ts,
+                        'detections': [d.copy() for d in detections],
+                        'version': self._latest_snapshot['version'] + 1
+                    }
+
+                if target_point: self.coords_updated.emit(target_point, ts)
+
+                # 🔧 В debug_buffer кладём ТОЛЬКО ссылку на версию снэпшота, а не копию данных
+                if self.mw.debug_win and self.mw.debug_win.isVisible():
+                    self.debug_buffer.put({
+                        'frame': inference_frame,
+                        'snapshot_version': self._latest_snapshot['version'],  # ссылка на версию
+                        'scale': scale,
+                        'capture_rect_left': capture_rect.left(),
+                        'capture_rect_top': capture_rect.top(),
+                        'ratio': ratio
+                    })
+
+                self.fps_counter += 1
+                now = time.time()
+                if now - self.last_fps_time >= 1.0:
+                    self.current_fps, self.fps_counter, self.last_fps_time = self.fps_counter, 0, now
+
+            except Exception as e:
+                print(f"[❌] Ошибка в DetectorThread: {e}")
+                time.sleep(0.002)
+
+
+# 🔧 DebugRendererThread читает из того же снэпшота по версии
+class DebugRendererThread(QThread):
+    frame_ready = pyqtSignal(QImage)
+
+    def __init__(self, mw, detector):
+        super().__init__()
+        self.mw, self.detector, self.running = mw, detector, True
+        self.debug_fps_limit = 60
+        self._last_debug_time = 0
+
+    def update_fps_limit(self, value):
+        self.debug_fps_limit = max(0, value)
+
+    def run(self):
+        while self.running:
+            now = time.time()
+            if not (self.mw.debug_win and self.mw.debug_win.isVisible()):
+                time.sleep(0.05)
+                continue
+            if self.debug_fps_limit > 0:
+                if (now - self._last_debug_time) < (1.0 / self.debug_fps_limit):
+                    time.sleep(0.001)
+                    continue
+
+            data = self.detector.debug_buffer.get_latest()
+            if not data or data['frame'] is None:
+                continue
+
+            # 🔧 Читаем снэпшот по версии из буфера — гарантия синхронизации
+            snapshot = None
+            with self.detector._coord_lock:
+                if self.detector._latest_snapshot['version'] == data.get('snapshot_version'):
+                    snapshot = self.detector._latest_snapshot.copy()
+
+            if not snapshot:
+                continue  # версия устарела, пропускаем кадр
+
+            dbg_frame = self._render_debug_frame(data, snapshot)
+            h, w, c = dbg_frame.shape
+            self.frame_ready.emit(QImage(dbg_frame.data, w, h, w * c, QImage.Format.Format_BGR888).copy())
+            self._last_debug_time = now
+            if self.debug_fps_limit > 0:
+                time.sleep(0.001)
+
+    def _render_debug_frame(self, data, snapshot):
+        frame, scale = data['frame'].copy(), data['scale']
+        ratio = data.get('ratio', 1.0)
+
+        # Рисуем детекции из снэпшота
+        for det in snapshot['detections']:
+            x1, y1, x2, y2 = det['bbox_local']
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
+
+        # 🔧 Рисуем крестик из ТОГО ЖЕ снэпшота
+        if snapshot['target']:
+            tx_local = int(((snapshot['target'][0] - data['capture_rect_left']) * ratio) * scale)
+            ty_local = int(((snapshot['target'][1] - data['capture_rect_top']) * ratio) * scale)
+            cv2.drawMarker(frame, (tx_local, ty_local), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+
+        cv2.putText(frame, f"DetFPS: {self.detector.current_fps}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 255), 2)
+        dbg_fps = int(1.0 / (time.time() - self._last_debug_time + 0.001)) if self._last_debug_time > 0 else 0
+        cv2.putText(frame, f"DbgFPS: {dbg_fps}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        return frame
+
+    def stop(self):
+        self.running = False
+
+
+class RangeOverlay(QWidget):
+    def __init__(self, mw):
+        super().__init__()
+        self.mw, self.drag_pt, self.active_sk = mw, None, None
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.showFullScreen()
+        QTimer.singleShot(500, self.apply_protection)
+
+    def apply_protection(self):
+        try:
+            ctypes.windll.user32.SetWindowDisplayAffinity(wintypes.HWND(int(self.winId())), WDA_EXCLUDEFROMCAPTURE)
+        except:
+            pass
+
+    def set_interactivity(self, sk, en):
+        self.active_sk = sk
+        f = Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
+        if not en: f |= Qt.WindowType.WindowTransparentForInput
+        self.setWindowFlags(f)
+        self.showFullScreen()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        sc = self.screen().geometry().center()
+        with self.mw.skills_lock:
+            for sk in self.mw.skills:
+                if not sk.check_show.isChecked() and not sk.check_edit.isChecked(): continue
+                cx, cy = sc.x() + sk.off_x, sc.y() + sk.off_y
+                path = QPainterPath()
+                pts = [QPointF(cx + pt[0], cy + pt[1]) for pt in sk.points]
+                if not pts: continue
+                path.moveTo((pts[0] + pts[7]) / 2)
+                for i in range(8): path.quadTo(pts[i], (pts[i] + pts[(i + 1) % 8]) / 2)
+                path.closeSubpath()
+                color = QColor(201, 160, 99) if sk.check_edit.isChecked() else (
+                    QColor(0, 255, 0, 80) if sk.is_target_in else QColor(0, 168, 232, 50))
+                p.setPen(QPen(color, 2))
+                p.setBrush(QColor(color.red(), color.green(), color.blue(), 20))
+                p.drawPath(path)
+                if sk.check_edit.isChecked():
+                    for pt in pts: p.drawEllipse(pt, 5, 5)
+
+        # 🔧 Читаем из того же атомарного снэпшота
+        if hasattr(self.mw, 'detector') and self.mw.detector.isRunning():
+            snapshot = None
+            with self.mw.detector._coord_lock:
+                # Берём снэпшот, если он свежий (<50 мс)
+                if (time.perf_counter() - self.mw.detector._latest_snapshot['ts']) < 0.05:
+                    snapshot = self.mw.detector._latest_snapshot.copy()
+
+            if snapshot and snapshot['target']:
+                tp = snapshot['target']
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 0, 255))
+                p.drawEllipse(QPointF(tp[0], tp[1]), 6, 6)
+
+            if self.mw.chk_show_fps_overlay.isChecked():
+                font = QFont("Segoe UI", 16, QFont.Weight.Bold)
+                p.setFont(font)
+                p.setPen(QColor(0, 255, 0))
+                p.drawText(50, 80, f"DETECTION FPS: {self.mw.detector.current_fps}")
+
+    def mousePressEvent(self, e):
+        if not self.active_sk: return
+        sc, sk, mp = self.screen().geometry().center(), self.active_sk, e.position()
+        cx, cy = sc.x() + sk.off_x, sc.y() + sk.off_y
+        if (mp - QPointF(cx, cy)).manhattanLength() < 20:
+            self.drag_pt = "center"
+        else:
+            for i, p in enumerate(sk.points):
+                if (mp - QPointF(cx + p[0], cy + p[1])).manhattanLength() < 15: self.drag_pt = i; break
+
+    def mouseMoveEvent(self, e):
+        if self.drag_pt is None or not self.active_sk: return
+        sc, sk, mp = self.screen().geometry().center(), self.active_sk, e.position()
+        if self.drag_pt == "center":
+            sk.off_x, sk.off_y = int(mp.x() - sc.x()), int(mp.y() - sc.y())
+        else:
+            sk.points[self.drag_pt] = [int(mp.x() - (sc.x() + sk.off_x)), int(mp.y() - (sc.y() + sk.off_y))]
+
+    def mouseReleaseEvent(self, e):
+        self.drag_pt = None
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("POBEDILDO")
+        self.setFixedSize(460, 960)
+        self.setStyleSheet(STYLE_SHEET)
+        self.is_active = False
+        self.skills, self.skills_lock = [], threading.Lock()
+        self.mana_region = None
+        self.target_hwnd, self.debug_win = None, None
+        self._tracking_disabled = False
+        self.live_preview_max_width = 1280
+        self.live_fps, self.nn_imgsz = 0, 1280
+        self.init_ui()
+        self.grabber = ScreenGrabber(self);
+        self.grabber.start()
+        self.overlay = RangeOverlay(self)
+        self.detector = DetectorThread(self);
+        self.detector.start()
+        self.debug_renderer = DebugRendererThread(self, self.detector);
+        self.debug_renderer.start()
+        self.zone_tracker = ZoneTrackerThread(self);
+        self.zone_tracker.start()
+        self.logic = LogicThread(self, self.zone_tracker);
+        self.logic.start()
+        self.ocr_timer = QTimer();
+        self.ocr_timer.timeout.connect(self.run_ocr);
+        self.ocr_timer.start(500)
+        self.scan_timer = QTimer();
+        self.scan_timer.timeout.connect(self.run_scan);
+        self.scan_timer.start(100)
+        self.ui_timer = QTimer();
+        self.ui_timer.timeout.connect(self.update_ui);
+        self.ui_timer.start(33)
+        self.refresh_profiles_list()
+
+    def init_ui(self):
+        central = QWidget();
+        self.layout = QVBoxLayout(central);
+        self.setCentralWidget(central)
+        top = QHBoxLayout()
+        self.btn_p = QPushButton("OFF");
+        self.btn_p.setFixedSize(60, 35);
+        self.btn_p.clicked.connect(self.toggle_status)
+        top.addWidget(self.btn_p)
+        self.chk_h = QCheckBox("Bind:");
+        self.btn_h = HotkeyButton("f1")
+        top.addWidget(self.chk_h);
+        top.addWidget(self.btn_h);
+        top.addStretch()
+        btn_pin = QPushButton("📌");
+        btn_pin.setFixedSize(35, 35);
+        btn_pin.clicked.connect(
+            lambda: self.setWindowFlags(self.windowFlags() ^ Qt.WindowType.WindowStaysOnTopHint) or self.show())
+        top.addWidget(btn_pin);
+        self.layout.addLayout(top)
+        wcap = QGroupBox("ЗАХВАТ");
+        wl = QHBoxLayout(wcap)
+        self.chk_win_capture = QCheckBox("Окно:");
+        self.e_win_name = QLineEdit("Albion Online Client")
+        self.btn_bind = QPushButton("LINK");
+        self.btn_bind.clicked.connect(self.bind_win)
+        wl.addWidget(self.chk_win_capture);
+        wl.addWidget(self.e_win_name);
+        wl.addWidget(self.btn_bind)
+        self.layout.addWidget(wcap)
+        modes = QHBoxLayout()
+        self.mode_cursor, self.mode_ai, self.mode_pixel = QRadioButton("CURSOR"), QRadioButton("AI"), QRadioButton(
+            "PIXEL")
+        self.mode_cursor.setChecked(True);
+        modes.addWidget(self.mode_cursor);
+        modes.addWidget(self.mode_ai);
+        modes.addWidget(self.mode_pixel)
+        self.layout.addLayout(modes)
+        ais = QGroupBox("AI / PIXEL SETTINGS");
+        al = QGridLayout(ais)
+        al.addWidget(QLabel("Model:"), 0, 0)
+        self.e_nn_model_path = QLineEdit();
+        al.addWidget(self.e_nn_model_path, 0, 1)
+        btn_m = QPushButton("...");
+        btn_m.clicked.connect(self.browse_model);
+        al.addWidget(btn_m, 0, 2)
+        al.addWidget(QLabel("Conf %:"), 1, 0);
+        self.s_nn_conf = QSpinBox();
+        self.s_nn_conf.setRange(1, 100);
+        self.s_nn_conf.setValue(40);
+        al.addWidget(self.s_nn_conf, 1, 1)
+        al.addWidget(QLabel("Off X:"), 2, 0);
+        self.s_nn_offset_x = QSpinBox();
+        self.s_nn_offset_x.setRange(-500, 500);
+        al.addWidget(self.s_nn_offset_x, 2, 1)
+        al.addWidget(QLabel("Off Y:"), 2, 2);
+        self.s_nn_offset_y = QSpinBox();
+        self.s_nn_offset_y.setRange(-500, 500);
+        self.s_nn_offset_y.setValue(40);
+        al.addWidget(self.s_nn_offset_y, 2, 3)
+        self.btn_debug = QPushButton("DEBUG VIEW");
+        self.btn_debug.clicked.connect(self.toggle_debug);
+        al.addWidget(self.btn_debug, 4, 0, 1, 4)
+        al.addWidget(QLabel("Качество:"), 5, 0);
+        self.cb_quality = QComboBox();
+        self.cb_quality.addItems(["960", "1280", "1600", "Оригинал"]);
+        self.cb_quality.setCurrentIndex(1);
+        al.addWidget(self.cb_quality, 5, 1)
+        al.addWidget(QLabel("imgsz:"), 6, 0);
+        self.cb_imgsz = QComboBox();
+        self.cb_imgsz.addItems(["640", "960", "1280", "1600"]);
+        self.cb_imgsz.setCurrentText("1280");
+        self.cb_imgsz.currentTextChanged.connect(self.on_imgsz_changed);
+        al.addWidget(self.cb_imgsz, 6, 1)
+        self.chk_show_fps_overlay = QCheckBox("Показывать FPS детекции на экране");
+        self.chk_show_fps_overlay.setStyleSheet("color: #00FF00; font-weight: bold;");
+        al.addWidget(self.chk_show_fps_overlay, 7, 0, 1, 4)
+        al.addWidget(QLabel("Debug FPS:"), 8, 0)
+        self.s_debug_fps = QSpinBox()
+        self.s_debug_fps.setRange(0, 144)
+        self.s_debug_fps.setValue(60)
+        self.s_debug_fps.setSpecialValueText("MAX")
+        self.s_debug_fps.setSuffix(" FPS" if self.s_debug_fps.value() > 0 else "")
+        self.s_debug_fps.setFixedWidth(80)
+        al.addWidget(self.s_debug_fps, 8, 1)
+        self.s_debug_fps.valueChanged.connect(self.on_debug_fps_changed)
+        self.layout.addWidget(ais)
+        prof = QGroupBox("ПРОФИЛЬ");
+        pl = QVBoxLayout(prof);
+        ph = QHBoxLayout()
+        self.c_prof = QComboBox();
+        self.c_prof.currentIndexChanged.connect(self.load_profile);
+        ph.addWidget(self.c_prof)
+        btn_save = QPushButton("SAVE");
+        btn_save.clicked.connect(self.save_profile);
+        ph.addWidget(btn_save)
+        self.e_new_prof = QLineEdit();
+        self.e_new_prof.setPlaceholderText("New Name...");
+        pl.addLayout(ph);
+        pl.addWidget(self.e_new_prof)
+        self.layout.addWidget(prof)
+        mana = QGroupBox("MANA (OCR)");
+        ml = QHBoxLayout(mana)
+        self.mana_view = QLabel();
+        self.mana_view.setFixedSize(100, 25);
+        self.mana_view.setStyleSheet("background:#000;")
+        self.mana_val = QLabel("0");
+        btn_mana = QPushButton("CAPT");
+        btn_mana.clicked.connect(self.capture_mana)
+        ml.addWidget(self.mana_view);
+        ml.addWidget(self.mana_val);
+        ml.addStretch();
+        ml.addWidget(btn_mana)
+        self.layout.addWidget(mana)
+        self.active_combos_ui = ActiveCombosWidget();
+        self.layout.addWidget(self.active_combos_ui)
+        self.layout.addWidget(SectionHeaderWidget("КОМБО"));
+        self.c_scroll = QScrollArea()
+        self.c_w = QWidget();
+        self.c_w.setObjectName("ScrollContent");
+        self.c_layout = QVBoxLayout(self.c_w)
+        self.c_scroll.setWidget(self.c_w);
+        self.c_scroll.setWidgetResizable(True);
+        self.c_scroll.setFixedHeight(120)
+        self.layout.addWidget(self.c_scroll);
+        btn_add_c = QPushButton("+ НОВОЕ КОМБО");
+        btn_add_c.setObjectName("ActionBtn")
+        btn_add_c.clicked.connect(lambda: self.c_layout.addWidget(ComboRow(self)));
+        self.layout.addWidget(btn_add_c)
+        self.layout.addWidget(SectionHeaderWidget("СКИЛЛЫ"));
+        self.s_scroll = QScrollArea();
+        self.s_scroll.setWidgetResizable(True)
+        self.s_w = QWidget();
+        self.s_layout = QGridLayout(self.s_w);
+        self.s_scroll.setWidget(self.s_w)
+        self.layout.addWidget(self.s_scroll);
+        btn_add_s = QPushButton("+ ДОБАВИТЬ СКИЛЛ");
+        btn_add_s.clicked.connect(lambda: self.add_skill_ui())
+        self.layout.addWidget(btn_add_s)
+
+    def bind_win(self):
+        self.target_hwnd = win32gui.FindWindow(None, self.e_win_name.text())
+        self.btn_bind.setStyleSheet("color: #00FF00" if self.target_hwnd else "color: #FF0000")
+
+    def toggle_status(self):
+        self.is_active = not self.is_active;
+        self.btn_p.setText("ON" if self.is_active else "OFF")
+        self.btn_p.setStyleSheet(f"background: {'#1A4D2E' if self.is_active else '#2D1414'};")
+
+    def toggle_debug(self):
+        if not self.debug_win:
+            self.debug_win = QWidget();
+            self.debug_win.setFixedSize(640, 480);
+            self.debug_win.setWindowTitle("Debug ROI")
+            layout = QVBoxLayout(self.debug_win);
+            self.debug_label = QLabel();
+            self.debug_label.setScaledContents(True)
+            layout.addWidget(self.debug_label);
+            self.debug_renderer.frame_ready.connect(lambda img: self.debug_label.setPixmap(QPixmap.fromImage(img)))
+        if self.debug_win.isVisible():
+            self.debug_win.hide()
+        else:
+            self.debug_win.show()
+
+    def on_imgsz_changed(self, val):
+        self.nn_imgsz = int(val)
+
+    def on_debug_fps_changed(self, value):
+        if hasattr(self, 'debug_renderer'):
+            self.debug_renderer.update_fps_limit(value)
+            self.s_debug_fps.setSuffix("" if value == 0 else " FPS")
+
+    def add_skill_ui(self, d=None):
+        with self.skills_lock:
+            w = SkillWidget(len(self.skills) + 1, self, d);
+            self.s_layout.addWidget(w, len(self.skills) // 2, len(self.skills) % 2)
+            self.skills.append(w)
+
+    def run_ocr(self):
+        if self.mana_region:
+            bgr = self.grabber.grab_bgr(self.mana_region, self.devicePixelRatio())
+            if bgr is not None:
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                text = pytesseract.image_to_string(gray,
+                                                   config='--psm 7 -c tessedit_char_whitelist=0123456789/').strip()
+                val = text.split('/')[0] if '/' in text else text
+                if val.isdigit(): self.logic.cur_mana = int(val); self.mana_val.setText(val)
+                # 🔧 FIX: QPixmap, а не Pixmap
+                self.mana_view.setPixmap(
+                    QPixmap.fromImage(QImage(bgr.data, bgr.shape[1], bgr.shape[0], QImage.Format.Format_BGR888)).scaled(
+                        self.mana_view.size()))
+
+    def run_scan(self):
+        if not self.is_active: return
+        with self.skills_lock:
+            for sk in self.skills:
+                if sk.region and sk.ready_img is not None:
+                    curr_bgr = self.grabber.grab_bgr(sk.region, self.devicePixelRatio())
+                    if curr_bgr is not None:
+                        templ = sk.get_ready_img_copy()
+                        if templ is not None and curr_bgr.shape[0] >= templ.shape[0]:
+                            res = cv2.matchTemplate(curr_bgr, templ, cv2.TM_CCOEFF_NORMED);
+                            _, val, _, _ = cv2.minMaxLoc(res)
+                            sk.apply_cd_ui(val > 0.9, val)
+
+    def update_ui(self):
+        self.overlay.update()
+        if self.chk_h.isChecked() and keyboard.is_pressed(self.btn_h.key): self.toggle_status(); time.sleep(0.3)
+        data_list = []
+        for row in self.findChildren(ComboRow):
+            if self.logic.is_bind_pressed(row.btn_key.key) or self.logic.combo_states.get(id(row), {}).get("tgl"):
+                req, ready = 0, True
+                for s in row.steps:
+                    with self.skills_lock:
+                        if s['skill_idx'] < len(self.skills):
+                            sk = self.skills[s['skill_idx']];
+                            req += sk.mana_cost.value()
+                            if not sk.is_ready: ready = False
+                data_list.append({"name": f"Combo {row.btn_key.key.upper()}", "current_mana": self.logic.cur_mana,
+                                  "required_mana": req, "cd_ready": ready})
+        self.active_combos_ui.update_active_combos(data_list)
+
+    def intersect_ray_polygon(self, pivot, target, poly):
+        rdx, rdy = target[0] - pivot[0], target[1] - pivot[1]
+        dist = math.sqrt(rdx ** 2 + rdy ** 2)
+        if dist < 1: return target
+        for i in range(len(poly)):
+            p1 = [pivot[0] + poly[i][0], pivot[1] + poly[i][1]];
+            p2 = [pivot[0] + poly[(i + 1) % len(poly)][0], pivot[1] + poly[(i + 1) % len(poly)][1]]
+            v1, v2, v3 = [pivot[0] - p1[0], pivot[1] - p1[1]], [p2[0] - p1[0], p2[1] - p1[1]], [-rdy, rdx]
+            dot = v2[0] * v3[0] + v2[1] * v3[1]
+            if abs(dot) > 1e-6:
+                t1 = (v2[0] * v1[1] - v2[1] * v1[0]) / dot;
+                t2 = (v1[0] * v3[0] + v1[1] * v3[1]) / dot
+                if t1 >= 0 and 0 <= t2 <= 1: return [pivot[0] + t1 * rdx, pivot[1] + t1 * rdy]
+        return target
+
+    def capture_mana(self):
+        self.selector = RegionSelector(lambda r: setattr(self, 'mana_region', r))
+
+    def capture_region(self, w):
+        self.selector = RegionSelector(lambda r: setattr(w, 'region', r))
+
+    def browse_model(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Model", "", "YOLO (*.pt *.onnx)");
+        self.e_nn_model_path.setText(f)
+
+    def save_profile(self):
+        name = self.e_new_prof.text() or self.c_prof.currentText()
+        if not name or "---" in name: return
+        data = {
+            'win_name': self.e_win_name.text(), 'win_capture': self.chk_win_capture.isChecked(),
+            'mode': 'ai' if self.mode_ai.isChecked() else ('pixel' if self.mode_pixel.isChecked() else 'cursor'),
+            'nn_model': self.e_nn_model_path.text(), 'nn_conf': self.s_nn_conf.value(),
+            'nn_offx': self.s_nn_offset_x.value(), 'nn_offy': self.s_nn_offset_y.value(),
+            'imgsz': self.nn_imgsz, 'show_fps_overlay': self.chk_show_fps_overlay.isChecked(),
+            'debug_fps': self.s_debug_fps.value(),
+            'mana_reg': [self.mana_region.left(), self.mana_region.top(), self.mana_region.width(),
+                         self.mana_region.height()] if self.mana_region else None,
+            'skills': [{'off_x': s.off_x, 'off_y': s.off_y, 'points': s.points, 'key': s.edit_key.text(),
+                        'mana': s.mana_cost.value(), 'reg': [s.region.left(), s.region.top(), s.region.width(),
+                                                             s.region.height()] if s.region else None} for s in
+                       self.skills],
+            'combos': [
+                {'trigger': r.trigger_mode.currentText(), 'key': r.btn_key.key, 'tracking': r.chk_tracking.isChecked(),
+                 'cond': r.condition_mode.currentText(), 'steps': r.steps} for r in self.findChildren(ComboRow)]
+        }
+        with open(os.path.join(PROFILES_DIR, f"{name}.json"), 'w', encoding='utf-8') as f: json.dump(data, f, indent=4)
+        self.refresh_profiles_list()
+
+    def load_profile(self):
+        # 🔧 FIX: останавливаем потоки перед модификацией UI, чтобы избежать гонки
+        was_active = self.is_active
+        if was_active:
+            self.is_active = False  # временно выключаем логику
+
+        if self.c_prof.currentIndex() <= 0:
+            if was_active: self.is_active = True
+            return
+
+        path = os.path.join(PROFILES_DIR, f"{self.c_prof.currentText()}.json")
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.e_win_name.setText(data.get('win_name', ''));
+            self.chk_win_capture.setChecked(data.get('win_capture', False))
+            self.e_nn_model_path.setText(data.get('nn_model', ''));
+            self.s_nn_conf.setValue(data.get('nn_conf', 40))
+            self.s_nn_offset_x.setValue(data.get('nn_offx', 0));
+            self.s_nn_offset_y.setValue(data.get('nn_offy', 40))
+            self.nn_imgsz = data.get('imgsz', 1280);
+            self.cb_imgsz.setCurrentText(str(self.nn_imgsz))
+            self.chk_show_fps_overlay.setChecked(data.get('show_fps_overlay', False))
+            debug_fps = data.get('debug_fps', 60)
+            self.s_debug_fps.setValue(debug_fps)
+            self.s_debug_fps.setSuffix("" if debug_fps == 0 else " FPS")
+            if hasattr(self, 'debug_renderer'): self.debug_renderer.update_fps_limit(debug_fps)
+            if data.get('mana_reg'): self.mana_region = QRect(*data['mana_reg'])
+
+            # 🔧 FIX: безопасно удаляем скиллы — сначала снимаем с layout, потом deleteLater
+            with self.skills_lock:
+                for s in self.skills:
+                    if s.parent(): s.setParent(None)  # убираем из layout
+                    s.deleteLater()
+                self.skills.clear()
+                # Даём время на обработку deleteLater
+                QApplication.processEvents()
+
+            for s_d in data.get('skills', []): self.add_skill_ui(s_d)
+
+            for r in self.findChildren(ComboRow):
+                if r.parent(): r.setParent(None)
+                r.deleteLater()
+            QApplication.processEvents()
+
+            for c_d in data.get('combos', []): self.c_layout.addWidget(ComboRow(self, c_d))
+
+        except Exception as e:
+            print(f"[❌] Ошибка загрузки профиля: {e}")
+        finally:
+            # 🔧 Восстанавливаем состояние активности
+            if was_active:
+                QTimer.singleShot(100, lambda: setattr(self, 'is_active', True))
+
+    def refresh_profiles_list(self):
+        self.c_prof.clear();
+        self.c_prof.addItems(
+            ["--- Профиль ---"] + [f.replace(".json", "") for f in os.listdir(PROFILES_DIR) if f.endswith(".json")])
+
+
+class RegionSelector(QWidget):
+    def __init__(self, cb):
+        super().__init__();
+        self.cb, self.origin = cb, QPoint()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setWindowOpacity(0.3);
+        self.setStyleSheet("background:black;");
+        self.showFullScreen()
+        self.rb = QRubberBand(QRubberBand.Shape.Rectangle, self)
+
+    def mousePressEvent(self, e): self.origin = e.pos(); self.rb.setGeometry(
+        QRect(self.origin, self.origin)); self.rb.show()
+
+    def mouseMoveEvent(self, e): self.rb.setGeometry(QRect(self.origin, e.pos()).normalized())
+
+    def mouseReleaseEvent(self, e): self.cb(self.rb.geometry()); self.close()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv);
+    win = MainWindow();
+    win.show();
+    sys.exit(app.exec())
