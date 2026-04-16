@@ -1,0 +1,3335 @@
+# app.py
+# Windows / Python 3.10+
+# pip install dxcam ultralytics opencv-python PySide6 pywin32
+
+import sys
+import os
+import json
+import time
+import math
+import base64
+import ctypes
+import platform
+import threading
+import queue
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple, Dict, Any
+
+import numpy as np
+import cv2
+
+import dxcam
+from ultralytics import YOLO
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+
+# ============================================================
+# DPI awareness
+# ============================================================
+def enable_dpi_awareness():
+    if platform.system().lower() != "windows":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+# ============================================================
+# WinAPI helpers
+# ============================================================
+def find_window_by_title(title: str):
+    import win32gui
+    hwnd = win32gui.FindWindow(None, title)
+    return hwnd if hwnd != 0 else None
+
+
+def get_window_rect(hwnd):
+    import win32gui
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    return left, top, right, bottom
+
+
+def get_monitor_rect_by_index(index: int):
+    import win32api
+    monitors = win32api.EnumDisplayMonitors()
+    if not monitors:
+        return (0, 0, 0, 0)
+    index = max(0, min(index, len(monitors) - 1))
+    hmon = monitors[index][0]
+    info = win32api.GetMonitorInfo(hmon)
+    rc = info["Monitor"]
+    return rc[0], rc[1], rc[2], rc[3]
+
+
+def get_virtual_desktop_rect() -> QtCore.QRect:
+    screens = QtGui.QGuiApplication.screens()
+    if not screens:
+        return QtWidgets.QApplication.primaryScreen().geometry()
+    rect = screens[0].geometry()
+    for s in screens[1:]:
+        rect = rect.united(s.geometry())
+    return rect
+
+
+# ============================================================
+# VK / mouse
+# ============================================================
+user32 = ctypes.windll.user32
+
+VK_RBUTTON = 0x02
+VK_MBUTTON = 0x04
+VK_XBUTTON1 = 0x05
+VK_XBUTTON2 = 0x06
+
+
+def is_vk_down(vk: int) -> bool:
+    if vk is None or int(vk) == 0:
+        return False
+    return (user32.GetAsyncKeyState(int(vk)) & 0x8000) != 0
+
+
+def set_cursor_pos(x: int, y: int):
+    user32.SetCursorPos(int(x), int(y))
+
+
+# ============================================================
+# SendInput: press keyboard OR mouse button by VK
+# ============================================================
+def send_press_by_vk(vk: int):
+    if platform.system().lower() != "windows":
+        return
+    vk = int(vk or 0)
+    if vk == 0:
+        return
+
+    INPUT_MOUSE = 0
+    INPUT_KEYBOARD = 1
+
+    KEYEVENTF_KEYUP = 0x0002
+
+    MOUSEEVENTF_RIGHTDOWN = 0x0008
+    MOUSEEVENTF_RIGHTUP = 0x0010
+    MOUSEEVENTF_MIDDLEDOWN = 0x0020
+    MOUSEEVENTF_MIDDLEUP = 0x0040
+    MOUSEEVENTF_XDOWN = 0x0080
+    MOUSEEVENTF_XUP = 0x0100
+
+    XBUTTON1 = 0x0001
+    XBUTTON2 = 0x0002
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", ctypes.c_ushort),
+            ("wScan", ctypes.c_ushort),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class _INPUT_UNION(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("u", _INPUT_UNION)]
+
+    extra = ctypes.c_ulong(0)
+
+    if vk in (VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2):
+        if vk == VK_RBUTTON:
+            down_flags, up_flags, data = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0
+        elif vk == VK_MBUTTON:
+            down_flags, up_flags, data = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 0
+        elif vk == VK_XBUTTON1:
+            down_flags, up_flags, data = MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON1
+        else:
+            down_flags, up_flags, data = MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON2
+
+        down = INPUT(type=INPUT_MOUSE, u=_INPUT_UNION(mi=MOUSEINPUT(0, 0, data, down_flags, 0, ctypes.pointer(extra))))
+        up = INPUT(type=INPUT_MOUSE, u=_INPUT_UNION(mi=MOUSEINPUT(0, 0, data, up_flags, 0, ctypes.pointer(extra))))
+        ctypes.windll.user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
+        ctypes.windll.user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(INPUT))
+        return
+
+    down = INPUT(type=INPUT_KEYBOARD, u=_INPUT_UNION(ki=KEYBDINPUT(vk, 0, 0, 0, ctypes.pointer(extra))))
+    up = INPUT(type=INPUT_KEYBOARD, u=_INPUT_UNION(ki=KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, ctypes.pointer(extra))))
+    ctypes.windll.user32.SendInput(1, ctypes.byref(down), ctypes.sizeof(INPUT))
+    ctypes.windll.user32.SendInput(1, ctypes.byref(up), ctypes.sizeof(INPUT))
+
+
+# ============================================================
+# Geometry helpers (blob path + contains + edge point)
+# ============================================================
+def smooth_closed_path(points: List[QtCore.QPointF]) -> QtGui.QPainterPath:
+    n = len(points)
+    path = QtGui.QPainterPath()
+    if n < 2:
+        return path
+
+    mids: List[QtCore.QPointF] = []
+    for i in range(n):
+        p1 = points[i]
+        p2 = points[(i + 1) % n]
+        mids.append(QtCore.QPointF((p1.x() + p2.x()) / 2.0, (p1.y() + p2.y()) / 2.0))
+
+    path.moveTo(mids[-1])
+    for i in range(n):
+        path.quadTo(points[i], mids[i])
+    path.closeSubpath()
+    path.setFillRule(QtCore.Qt.WindingFill)
+    return path
+
+
+def path_contains_point(path: QtGui.QPainterPath, pt: QtCore.QPointF, center_pt: Optional[QtCore.QPointF] = None) -> bool:
+    # центр всегда считается "внутри"
+    if center_pt is not None and QtCore.QLineF(center_pt, pt).length() <= 1.5:
+        return True
+    return bool(path.contains(pt))
+
+
+def edge_point_on_ray(path: QtGui.QPainterPath, center: QtCore.QPointF, probe: QtCore.QPointF) -> Optional[QtCore.QPointF]:
+    dx = probe.x() - center.x()
+    dy = probe.y() - center.y()
+    dist = math.hypot(dx, dy)
+    if dist < 1e-6:
+        return None
+    ux, uy = dx / dist, dy / dist
+
+    br = path.boundingRect()
+    max_dist = float(math.hypot(br.width(), br.height()) * 3.0 + 50.0)
+    step = 4.0
+
+    last_inside = None
+    t = 0.0
+    while t <= max_dist:
+        p = QtCore.QPointF(center.x() + ux * t, center.y() + uy * t)
+        if path.contains(p):
+            last_inside = p
+            t += step
+        else:
+            break
+
+    if last_inside is None:
+        return None
+
+    # binary refine from last_inside toward outside (within step)
+    lo = 0.0
+    hi = step
+    base = last_inside
+    for _ in range(14):
+        mid = (lo + hi) / 2.0
+        pm = QtCore.QPointF(base.x() + ux * mid, base.y() + uy * mid)
+        if path.contains(pm):
+            lo = mid
+        else:
+            hi = mid
+    return QtCore.QPointF(base.x() + ux * lo, base.y() + uy * lo)
+
+
+# ============================================================
+# Settings
+# ============================================================
+@dataclass
+class Settings:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    running: bool = False
+
+    capture_enabled: bool = True
+    capture_mode: str = "screen"  # "screen" | "window"
+    window_title: str = ""
+    hwnd: int | None = None
+    output_idx: int = 0
+
+    imgsz: int = 1280
+    conf: float = 0.25
+    y_offset: int = 40
+
+    overlay_enabled: bool = True
+    fps_overlay_enabled: bool = True
+    debug_enabled: bool = True
+
+    # aim engine
+    aim_mode: str = "off"        # "off" | "inline" | "thread"
+    aim_active: bool = False     # включается ТОЛЬКО правилами (bind правила удерживается)
+    aim_suspended: bool = False  # временно глушим aim на шаге
+
+    device: str = "0"
+    model_path: str | None = None
+    _model_reload_token: int = 0
+
+    def request_model_reload(self, path: str):
+        with self.lock:
+            self.model_path = path
+            self._model_reload_token += 1
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "running": self.running,
+                "capture_enabled": self.capture_enabled,
+                "capture_mode": self.capture_mode,
+                "window_title": self.window_title,
+                "hwnd": self.hwnd,
+                "output_idx": int(self.output_idx),
+                "imgsz": int(self.imgsz),
+                "conf": float(self.conf),
+                "y_offset": int(self.y_offset),
+                "overlay_enabled": bool(self.overlay_enabled),
+                "fps_overlay_enabled": bool(self.fps_overlay_enabled),
+                "debug_enabled": bool(self.debug_enabled),
+                "aim_mode": self.aim_mode,
+                "aim_active": bool(self.aim_active),
+                "aim_suspended": bool(self.aim_suspended),
+                "device": self.device,
+                "model_path": self.model_path,
+                "_model_reload_token": int(self._model_reload_token),
+            }
+
+
+# ============================================================
+# Templates store
+# ============================================================
+@dataclass
+class TemplateTabData:
+    tab_id: int
+    name: str = "Tab"
+
+    hotkey_vk: int = 0
+    hotkey_text: str = ""
+
+    roi_rel: Optional[Tuple[int, int, int, int]] = None
+    template_bgr: Optional[np.ndarray] = None
+
+    overlay_enabled: bool = False
+    overlay_points_rel: Optional[List[Tuple[float, float]]] = None
+    overlay_center_rel: Optional[Tuple[float, float]] = None
+
+
+class TemplateStore:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._tabs: List[TemplateTabData] = []
+        self._next_id = 1
+
+    def clear_and_load(self, tabs: List[TemplateTabData]):
+        with self.lock:
+            self._tabs = tabs
+            self._next_id = (max([t.tab_id for t in tabs], default=0) + 1)
+
+    def add_tab(self, name: Optional[str] = None) -> int:
+        with self.lock:
+            tid = self._next_id
+            self._next_id += 1
+            self._tabs.append(TemplateTabData(tab_id=tid, name=name or f"{tid}"))
+            return tid
+
+    def remove_tab(self, tab_id: int) -> None:
+        with self.lock:
+            self._tabs = [t for t in self._tabs if t.tab_id != tab_id]
+
+    def set_hotkey(self, tab_id: int, vk: int, text: str):
+        with self.lock:
+            for t in self._tabs:
+                if t.tab_id == tab_id:
+                    t.hotkey_vk = int(vk or 0)
+                    t.hotkey_text = str(text or "")
+                    return
+
+    def set_overlay_center(self, tab_id: int, center_rel: Tuple[float, float] | None):
+        with self.lock:
+            for t in self._tabs:
+                if t.tab_id == tab_id:
+                    t.overlay_center_rel = center_rel
+                    return
+
+    def list_tabs_snapshot(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return [
+                {
+                    "tab_id": t.tab_id,
+                    "name": t.name,
+                    "hotkey_vk": int(t.hotkey_vk),
+                    "hotkey_text": str(t.hotkey_text),
+                }
+                for t in self._tabs
+            ]
+
+    def get_tab_snapshot(self, tab_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            for t in self._tabs:
+                if t.tab_id == tab_id:
+                    return {
+                        "tab_id": t.tab_id,
+                        "name": t.name,
+                        "hotkey_vk": int(t.hotkey_vk),
+                        "hotkey_text": str(t.hotkey_text),
+                        "roi_rel": t.roi_rel,
+                        "template_bgr": t.template_bgr,
+                        "overlay_enabled": bool(t.overlay_enabled),
+                        "overlay_points_rel": t.overlay_points_rel,
+                        "overlay_center_rel": t.overlay_center_rel,
+                    }
+        return None
+
+    def update_roi(self, tab_id: int, roi_rel: Tuple[int, int, int, int]) -> None:
+        with self.lock:
+            for t in self._tabs:
+                if t.tab_id == tab_id:
+                    t.roi_rel = roi_rel
+                    t.template_bgr = None
+                    return
+
+    def set_template(self, tab_id: int, template_bgr: np.ndarray) -> None:
+        with self.lock:
+            for t in self._tabs:
+                if t.tab_id == tab_id:
+                    t.template_bgr = template_bgr
+                    return
+
+    def set_overlay_enabled(self, tab_id: int, enabled: bool) -> None:
+        with self.lock:
+            for t in self._tabs:
+                if t.tab_id == tab_id:
+                    t.overlay_enabled = bool(enabled)
+                    return
+
+    def set_overlay_points(self, tab_id: int, pts_rel: List[Tuple[float, float]]) -> None:
+        with self.lock:
+            for t in self._tabs:
+                if t.tab_id == tab_id:
+                    t.overlay_points_rel = pts_rel
+                    return
+
+    def snapshot_for_worker(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return [
+                {
+                    "tab_id": t.tab_id,
+                    "name": t.name,
+                    "hotkey_vk": int(t.hotkey_vk),
+                    "hotkey_text": str(t.hotkey_text),
+                    "roi_rel": t.roi_rel,
+                    "template_bgr": t.template_bgr,
+                    "overlay_enabled": bool(t.overlay_enabled),
+                    "overlay_points_rel": t.overlay_points_rel,
+                    "overlay_center_rel": t.overlay_center_rel,
+                }
+                for t in self._tabs
+            ]
+
+
+class SharedFrameBuffer:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame_bgr: Optional[np.ndarray] = None
+        self.t: float = 0.0
+        self.offset_x: int = 0
+        self.offset_y: int = 0
+
+    def update(self, frame_bgr: np.ndarray, offset_x: int, offset_y: int, t: float):
+        with self.lock:
+            self.frame_bgr = frame_bgr
+            self.offset_x = int(offset_x)
+            self.offset_y = int(offset_y)
+            self.t = float(t)
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "frame_bgr": self.frame_bgr,
+                "offset_x": int(self.offset_x),
+                "offset_y": int(self.offset_y),
+                "t": float(self.t),
+            }
+
+
+class SharedTargetBuffer:
+    """
+    last AIM/TARGET ABS (AIM = cx, cy+y_offset; TARGET = bbox center)
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.target_abs: Optional[Tuple[int, int]] = None
+        self.aim_abs: Optional[Tuple[int, int]] = None
+
+    def update(self, target_abs: Optional[Tuple[int, int]], aim_abs: Optional[Tuple[int, int]]):
+        with self.lock:
+            self.target_abs = target_abs
+            self.aim_abs = aim_abs
+
+    def snapshot(self):
+        with self.lock:
+            return {"target_abs": self.target_abs, "aim_abs": self.aim_abs}
+
+
+# ============================================================
+# Rules
+# ============================================================
+@dataclass
+class RuleStep:
+    template_tab_id: Optional[int] = None
+
+    # action = press_card_key | move_cursor_to_edge
+    action: str = "press_card_key"
+
+    # condition: require AIM point inside overlay (of this tab)
+    require_target_inside_overlay: bool = False
+
+    # if outside and require_target_inside_overlay:
+    # press key + wait until AIM enters overlay
+    press_key_if_outside_and_wait: bool = True
+    outside_key_vk: int = 0x53
+    outside_key_text: str = "S"
+    outside_poll_ms: int = 30
+    outside_timeout_ms: int = 0  # 0=infinite
+
+    # temporary aim control
+    disable_aim_on_step: bool = False
+
+    # delay after step
+    delay_ms_after: int = 0
+
+    # repeat: if AIM moved > threshold after step -> press key -> repeat step
+    repeat_if_aim_moved: bool = False
+    aim_move_threshold_px: int = 10
+    repeat_key_vk: int = 0x53
+    repeat_key_text: str = "S"
+    repeat_max_times: int = 30
+
+    comment: str = ""
+
+
+@dataclass
+class RuleSet:
+    rule_id: int
+    name: str = "Rule"
+    enabled: bool = True
+
+    bind_vk: int = 0
+    bind_text: str = ""
+
+    aim_enabled_on_bind_hold: bool = False
+    require_all_ready: bool = False
+
+    steps: List[RuleStep] = field(default_factory=list)
+
+
+class RulesStore:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._rules: List[RuleSet] = []
+        self._next_id = 1
+
+    def clear_and_load(self, rules: List[RuleSet]):
+        with self.lock:
+            self._rules = rules
+            self._next_id = (max([r.rule_id for r in rules], default=0) + 1)
+
+    def add(self, name: Optional[str] = None) -> int:
+        with self.lock:
+            rid = self._next_id
+            self._next_id += 1
+            self._rules.append(RuleSet(rule_id=rid, name=name or f"Rule {rid}"))
+            return rid
+
+    def remove(self, rule_id: int):
+        with self.lock:
+            self._rules = [r for r in self._rules if r.rule_id != rule_id]
+
+    def get_copy(self, rule_id: int) -> Optional[RuleSet]:
+        with self.lock:
+            for r in self._rules:
+                if r.rule_id == rule_id:
+                    return RuleSet(
+                        rule_id=r.rule_id,
+                        name=r.name,
+                        enabled=r.enabled,
+                        bind_vk=int(r.bind_vk),
+                        bind_text=str(r.bind_text),
+                        aim_enabled_on_bind_hold=bool(r.aim_enabled_on_bind_hold),
+                        require_all_ready=bool(r.require_all_ready),
+                        steps=[RuleStep(**s.__dict__) for s in r.steps],
+                    )
+        return None
+
+    def save(self, ruleset: RuleSet):
+        with self.lock:
+            for i, r in enumerate(self._rules):
+                if r.rule_id == ruleset.rule_id:
+                    self._rules[i] = ruleset
+                    return
+
+    def snapshot_for_runtime(self) -> List[RuleSet]:
+        with self.lock:
+            return [
+                RuleSet(
+                    rule_id=r.rule_id,
+                    name=r.name,
+                    enabled=r.enabled,
+                    bind_vk=int(r.bind_vk),
+                    bind_text=str(r.bind_text),
+                    aim_enabled_on_bind_hold=bool(r.aim_enabled_on_bind_hold),
+                    require_all_ready=bool(r.require_all_ready),
+                    steps=[RuleStep(**s.__dict__) for s in r.steps],
+                )
+                for r in self._rules
+            ]
+
+    def list_snapshot(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return [
+                {
+                    "rule_id": r.rule_id,
+                    "name": r.name,
+                    "bind_text": r.bind_text,
+                    "aim_on_hold": bool(r.aim_enabled_on_bind_hold),
+                    "all_ready": bool(r.require_all_ready),
+                    "steps": len(r.steps),
+                    "enabled": bool(r.enabled),
+                }
+                for r in self._rules
+            ]
+
+
+# ============================================================
+# Rule monitor (optional block)
+# ============================================================
+@dataclass
+class RuleMonitorState:
+    active: bool = False
+    rule_id: Optional[int] = None
+    rule_name: str = ""
+    phase: str = ""  # e.g. "WAIT_INSIDE", "STEP", "DONE", "ABORT"
+    step_index: int = 0
+    steps_total: int = 0
+    message: str = ""
+    missing: str = ""
+    done: str = ""
+    ts: float = 0.0
+
+
+class RuleMonitor:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.enabled = False
+        self.state = RuleMonitorState()
+
+    def set_enabled(self, on: bool):
+        with self.lock:
+            self.enabled = bool(on)
+            if not self.enabled:
+                self.state = RuleMonitorState(active=False, ts=time.time())
+
+    def update(self, **kwargs):
+        with self.lock:
+            if not self.enabled:
+                return
+            for k, v in kwargs.items():
+                if hasattr(self.state, k):
+                    setattr(self.state, k, v)
+            self.state.ts = time.time()
+
+    def snapshot(self) -> RuleMonitorState:
+        with self.lock:
+            return RuleMonitorState(**self.state.__dict__)
+
+
+# ============================================================
+# Flow layout (wrap)
+# ============================================================
+class FlowLayout(QtWidgets.QLayout):
+    def __init__(self, parent=None, margin=0, hspacing=8, vspacing=8):
+        super().__init__(parent)
+        self._item_list: List[QtWidgets.QLayoutItem] = []
+        self._hspacing = hspacing
+        self._vspacing = vspacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item: QtWidgets.QLayoutItem) -> None:
+        self._item_list.append(item)
+        self.invalidate()
+
+    def addWidget(self, w: QtWidgets.QWidget) -> None:
+        self.addChildWidget(w)
+        self.addItem(QtWidgets.QWidgetItem(w))
+
+    def count(self) -> int:
+        return len(self._item_list)
+
+    def itemAt(self, index: int) -> Optional[QtWidgets.QLayoutItem]:
+        if 0 <= index < len(self._item_list):
+            return self._item_list[index]
+        return None
+
+    def takeAt(self, index: int) -> Optional[QtWidgets.QLayoutItem]:
+        if 0 <= index < len(self._item_list):
+            it = self._item_list.pop(index)
+            self.invalidate()
+            return it
+        return None
+
+    def expandingDirections(self):
+        return QtCore.Qt.Orientations(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QtCore.QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QtCore.QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QtCore.QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QtCore.QSize:
+        size = QtCore.QSize()
+        for item in self._item_list:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        size += QtCore.QSize(m.left() + m.right(), m.top() + m.bottom())
+        return size
+
+    def _do_layout(self, rect: QtCore.QRect, test_only: bool) -> int:
+        line_height = 0
+        m = self.contentsMargins()
+        effective_rect = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x = effective_rect.x()
+        y = effective_rect.y()
+
+        for item in self._item_list:
+            w = item.widget()
+            if w is None or not w.isVisible():
+                continue
+
+            next_x = x + item.sizeHint().width() + self._hspacing
+            if next_x - self._hspacing > effective_rect.right() and line_height > 0:
+                x = effective_rect.x()
+                y = y + line_height + self._vspacing
+                next_x = x + item.sizeHint().width() + self._hspacing
+                line_height = 0
+
+            if not test_only:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), item.sizeHint()))
+
+            x = next_x
+            line_height = max(line_height, item.sizeHint().height())
+
+        return y + line_height - rect.y() + m.bottom()
+
+
+# ============================================================
+# Region selector
+# ============================================================
+class RegionSelectDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select region")
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.Tool
+        )
+        self.setModal(True)
+        self.setCursor(QtCore.Qt.CrossCursor)
+
+        self._vd_rect = get_virtual_desktop_rect()
+        self.setGeometry(self._vd_rect)
+
+        self._start: Optional[QtCore.QPoint] = None
+        self._end: Optional[QtCore.QPoint] = None
+        self._abs_rect: Optional[QtCore.QRect] = None
+
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+
+    def mousePressEvent(self, e: QtGui.QMouseEvent):
+        if e.button() == QtCore.Qt.LeftButton:
+            self._start = e.position().toPoint()
+            self._end = self._start
+            self.update()
+        elif e.button() == QtCore.Qt.RightButton:
+            self.reject()
+
+    def mouseMoveEvent(self, e: QtGui.QMouseEvent):
+        if self._start is None:
+            return
+        self._end = e.position().toPoint()
+        self.update()
+
+    def mouseReleaseEvent(self, e: QtGui.QMouseEvent):
+        if e.button() != QtCore.Qt.LeftButton or self._start is None or self._end is None:
+            return
+        r = QtCore.QRect(self._start, self._end).normalized()
+        abs_left = self._vd_rect.left() + r.left()
+        abs_top = self._vd_rect.top() + r.top()
+        self._abs_rect = QtCore.QRect(abs_left, abs_top, r.width(), r.height())
+        if self._abs_rect.width() < 5 or self._abs_rect.height() < 5:
+            self.reject()
+            return
+        self.accept()
+
+    def keyPressEvent(self, e: QtGui.QKeyEvent):
+        if e.key() == QtCore.Qt.Key_Escape:
+            self.reject()
+
+    def paintEvent(self, e):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 90))
+        if self._start is not None and self._end is not None:
+            r = QtCore.QRect(self._start, self._end).normalized()
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 255, 230), 2))
+            p.setBrush(QtGui.QBrush(QtGui.QColor(0, 200, 255, 40)))
+            p.drawRect(r)
+        p.end()
+
+    def abs_rect(self) -> Optional[QtCore.QRect]:
+        return self._abs_rect
+
+
+# ============================================================
+# HotkeyEdit (captures keyboard + mouse incl XBUTTON1/2)
+# ============================================================
+class HotkeyEdit(QtWidgets.QLineEdit):
+    hotkey_changed = QtCore.Signal(int, str)
+
+    def __init__(self, parent=None, width=76, placeholder="KEY"):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setPlaceholderText(placeholder)
+        self.setFixedWidth(width)
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setStyleSheet("""
+QLineEdit{
+  background:#1f1f1f; color:#ddd;
+  border:1px solid #3a3a3a;
+  border-radius:7px;
+  padding:2px 6px;
+  font-weight:900;
+}
+QLineEdit:focus{ border-color: rgba(0,220,255,190); }
+""")
+        self._capturing = False
+
+    def mousePressEvent(self, e: QtGui.QMouseEvent):
+        super().mousePressEvent(e)
+        if e.button() == QtCore.Qt.LeftButton:
+            self.start_capture()
+
+    def start_capture(self):
+        if self._capturing:
+            return
+        self._capturing = True
+        self.setText("PRESS...")
+        self.setFocus(QtCore.Qt.MouseFocusReason)
+        app = QtWidgets.QApplication.instance()
+        if app:
+            app.installEventFilter(self)
+
+    def _finish(self):
+        self._capturing = False
+        app = QtWidgets.QApplication.instance()
+        if app:
+            app.removeEventFilter(self)
+        self.clearFocus()
+
+    def _set_vk(self, vk: int, text: str):
+        self.setText(text)
+        self.hotkey_changed.emit(int(vk or 0), str(text or ""))
+
+    def eventFilter(self, obj, event):
+        if not self._capturing:
+            return False
+
+        et = event.type()
+
+        if et == QtCore.QEvent.KeyPress:
+            e: QtGui.QKeyEvent = event
+            if e.key() == QtCore.Qt.Key_Escape:
+                self._finish()
+                self.setText("")
+                return True
+            if e.key() in (QtCore.Qt.Key_Backspace, QtCore.Qt.Key_Delete):
+                self._finish()
+                self.setText("")
+                self.hotkey_changed.emit(0, "")
+                return True
+
+            vk = int(e.nativeVirtualKey()) if platform.system().lower() == "windows" else 0
+            text = QtGui.QKeySequence(e.key()).toString()
+            if not text:
+                text = f"VK_{vk}" if vk else "KEY"
+
+            self._finish()
+            self._set_vk(vk, text)
+            return True
+
+        if et == QtCore.QEvent.MouseButtonPress:
+            e: QtGui.QMouseEvent = event
+            btn = e.button()
+            if btn == QtCore.Qt.LeftButton:
+                return True
+
+            if btn == QtCore.Qt.RightButton:
+                vk, text = VK_RBUTTON, "RMB"
+            elif btn == QtCore.Qt.MiddleButton:
+                vk, text = VK_MBUTTON, "MMB"
+            elif btn == QtCore.Qt.XButton1:
+                vk, text = VK_XBUTTON1, "XBUTTON1"
+            elif btn == QtCore.Qt.XButton2:
+                vk, text = VK_XBUTTON2, "XBUTTON2"
+            else:
+                return True
+
+            self._finish()
+            self._set_vk(vk, text)
+            return True
+
+        return False
+
+
+# ============================================================
+# Overlay window (blob + center + hit test coloring)
+# ============================================================
+class OverlayWindow(QtWidgets.QWidget):
+    """
+    VIEW: click-through, draw shapes
+    EDIT: intercept mouse, drag 8 points and center point
+    """
+    def __init__(self, settings: Settings, store: TemplateStore, shared_frame: SharedFrameBuffer):
+        super().__init__()
+        self.settings = settings
+        self.store = store
+        self.shared_frame = shared_frame
+
+        self.setWindowTitle("Overlay")
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.Tool
+        )
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+        self._aim_x = None
+        self._aim_y = None
+        self._fps = None
+        self._show_fps = True
+        self._show_point = True
+
+        # shapes: {"tab_id":.., "poly":[(absx,absy)...], "center":(absx,absy)|None}
+        self._shapes: List[Dict[str, Any]] = []
+
+        self._edit_tab_id: Optional[int] = None
+        self._edit_points_abs: Optional[List[QtCore.QPointF]] = None
+        self._edit_center_abs: Optional[QtCore.QPointF] = None
+        self._drag_idx: Optional[int] = None
+        self._drag_center: bool = False
+
+        self._handle_r = 10.0
+        self._center_r = 9.0
+
+        self._set_geometry_all_screens()
+        self.show()
+
+        if platform.system().lower() == "windows":
+            self._set_click_through(True)
+        else:
+            self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+
+    def _set_geometry_all_screens(self):
+        self.setGeometry(get_virtual_desktop_rect())
+
+    def _set_click_through(self, enabled: bool):
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, enabled)
+        if platform.system().lower() != "windows":
+            return
+        try:
+            hwnd = int(self.winId())
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_TOOLWINDOW = 0x00000080
+
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style |= WS_EX_LAYERED | WS_EX_TOOLWINDOW
+            if enabled:
+                style |= WS_EX_TRANSPARENT
+            else:
+                style &= ~WS_EX_TRANSPARENT
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_FRAMECHANGED = 0x0020
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
+        except Exception:
+            pass
+
+    @QtCore.Slot(object)
+    def update_state(self, payload: dict):
+        if "x" in payload:
+            self._aim_x = payload.get("x", None)
+        if "y" in payload:
+            self._aim_y = payload.get("y", None)
+        if "fps" in payload:
+            self._fps = payload.get("fps", None)
+        if "show_point" in payload:
+            self._show_point = bool(payload.get("show_point", True))
+        if "show_fps" in payload:
+            self._show_fps = bool(payload.get("show_fps", True))
+        if "shapes" in payload:
+            self._shapes = payload.get("shapes", []) or []
+        self.update()
+
+    def toggle_edit(self, tab_id: int):
+        if self._edit_tab_id == tab_id:
+            self.end_edit()
+        else:
+            self.begin_edit(tab_id)
+
+    def begin_edit(self, tab_id: int):
+        snap = self.shared_frame.snapshot()
+        frame = snap["frame_bgr"]
+        offx = int(snap["offset_x"])
+        offy = int(snap["offset_y"])
+        if frame is None:
+            return
+
+        h, w = frame.shape[:2]
+        tab = self.store.get_tab_snapshot(tab_id)
+        pts_rel = None if tab is None else tab.get("overlay_points_rel", None)
+
+        if not pts_rel or len(pts_rel) != 8:
+            cx, cy = w / 2.0, h / 2.0
+            rx, ry = w * 0.18, h * 0.18
+            pts_rel = [
+                (cx, cy - ry),
+                (cx + rx, cy - ry),
+                (cx + rx, cy),
+                (cx + rx, cy + ry),
+                (cx, cy + ry),
+                (cx - rx, cy + ry),
+                (cx - rx, cy),
+                (cx - rx, cy - ry),
+            ]
+            self.store.set_overlay_points(tab_id, pts_rel)
+            self.store.set_overlay_enabled(tab_id, True)
+
+        center_rel = None if tab is None else tab.get("overlay_center_rel", None)
+        if center_rel is None:
+            cx = float(sum(p[0] for p in pts_rel) / len(pts_rel))
+            cy = float(sum(p[1] for p in pts_rel) / len(pts_rel))
+            center_rel = (cx, cy)
+            self.store.set_overlay_center(tab_id, center_rel)
+
+        self._edit_tab_id = tab_id
+        self._edit_points_abs = [QtCore.QPointF(px + offx, py + offy) for (px, py) in pts_rel]
+        self._edit_center_abs = QtCore.QPointF(float(center_rel[0]) + offx, float(center_rel[1]) + offy)
+        self._drag_idx = None
+        self._drag_center = False
+
+        self._set_click_through(False)
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(QtCore.Qt.ActiveWindowFocusReason)
+        self.update()
+
+    def end_edit(self):
+        self._edit_tab_id = None
+        self._edit_points_abs = None
+        self._edit_center_abs = None
+        self._drag_idx = None
+        self._drag_center = False
+        self._set_click_through(True)
+        self.update()
+
+    def _abs_from_event(self, e: QtGui.QMouseEvent) -> QtCore.QPointF:
+        gx = self.geometry().left()
+        gy = self.geometry().top()
+        p = e.position()
+        return QtCore.QPointF(p.x() + gx, p.y() + gy)
+
+    def _hit_handle(self, abs_pt: QtCore.QPointF) -> Optional[int]:
+        if not self._edit_points_abs:
+            return None
+        for i, hp in enumerate(self._edit_points_abs):
+            if QtCore.QLineF(abs_pt, hp).length() <= self._handle_r:
+                return i
+        return None
+
+    def _hit_center(self, abs_pt: QtCore.QPointF) -> bool:
+        if self._edit_center_abs is None:
+            return False
+        return QtCore.QLineF(abs_pt, self._edit_center_abs).length() <= self._center_r
+
+    def mousePressEvent(self, e: QtGui.QMouseEvent):
+        if self._edit_tab_id is None:
+            return
+        if e.button() == QtCore.Qt.RightButton:
+            self.end_edit()
+            return
+        if e.button() != QtCore.Qt.LeftButton:
+            return
+        abs_pt = self._abs_from_event(e)
+
+        if self._hit_center(abs_pt):
+            self._drag_center = True
+            self._drag_idx = None
+            return
+
+        self._drag_idx = self._hit_handle(abs_pt)
+        self._drag_center = False
+
+    def mouseMoveEvent(self, e: QtGui.QMouseEvent):
+        if self._edit_tab_id is None:
+            return
+        abs_pt = self._abs_from_event(e)
+
+        snap = self.shared_frame.snapshot()
+        offx = int(snap["offset_x"])
+        offy = int(snap["offset_y"])
+
+        if self._drag_center and self._edit_center_abs is not None:
+            self._edit_center_abs = abs_pt
+            center_rel = (float(abs_pt.x() - offx), float(abs_pt.y() - offy))
+            self.store.set_overlay_center(int(self._edit_tab_id), center_rel)
+            self.update()
+            return
+
+        if self._drag_idx is None or self._edit_points_abs is None:
+            return
+
+        self._edit_points_abs[self._drag_idx] = abs_pt
+        pts_rel = [(float(p.x() - offx), float(p.y() - offy)) for p in self._edit_points_abs]
+        self.store.set_overlay_points(int(self._edit_tab_id), pts_rel)
+        self.store.set_overlay_enabled(int(self._edit_tab_id), True)
+        self.update()
+
+    def mouseReleaseEvent(self, e: QtGui.QMouseEvent):
+        if e.button() == QtCore.Qt.LeftButton:
+            self._drag_idx = None
+            self._drag_center = False
+
+    def keyPressEvent(self, e: QtGui.QKeyEvent):
+        if self._edit_tab_id is not None and e.key() == QtCore.Qt.Key_Escape:
+            self.end_edit()
+            return
+        super().keyPressEvent(e)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        gx = self.geometry().left()
+        gy = self.geometry().top()
+
+        probe_local = None
+        if self._aim_x is not None and self._aim_y is not None:
+            probe_local = QtCore.QPointF(float(self._aim_x - gx), float(self._aim_y - gy))
+
+        # shapes
+        for sh in self._shapes:
+            poly = sh.get("poly", [])
+            if not poly or len(poly) < 2:
+                continue
+            tab_id = sh.get("tab_id", None)
+            is_active = (self._edit_tab_id is not None and tab_id == self._edit_tab_id)
+
+            pts_local = [QtCore.QPointF(x - gx, y - gy) for (x, y) in poly]
+            path = smooth_closed_path(pts_local)
+
+            center_abs = sh.get("center", None)
+            center_local = None
+            if center_abs is not None:
+                center_local = QtCore.QPointF(center_abs[0] - gx, center_abs[1] - gy)
+
+            inside = False
+            if (probe_local is not None) and (not is_active) and (self._edit_tab_id is None):
+                inside = path_contains_point(path, probe_local, center_local)
+
+            # colors
+            if is_active:
+                stroke = QtGui.QColor(0, 220, 255, 230)
+                fill = QtGui.QColor(0, 220, 255, 60)
+                width = 3
+            else:
+                if self._edit_tab_id is not None:
+                    stroke = QtGui.QColor(120, 120, 120, 90)
+                    fill = QtGui.QColor(120, 120, 120, 25)
+                    width = 2
+                else:
+                    if inside:
+                        stroke = QtGui.QColor(46, 204, 113, 235)
+                        fill = QtGui.QColor(46, 204, 113, 70)
+                        width = 3
+                    else:
+                        stroke = QtGui.QColor(0, 220, 255, 200)
+                        fill = QtGui.QColor(0, 220, 255, 45)
+                        width = 2
+
+            painter.setPen(QtGui.QPen(stroke, width))
+            painter.setBrush(QtGui.QBrush(fill))
+            painter.drawPath(path)
+
+            # center dot in view mode
+            if center_local is not None and self._edit_tab_id is None:
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 200), 1))
+                painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 255, 255, 140)))
+                painter.drawEllipse(center_local, 3, 3)
+
+        # edit overlays: redraw active with handles + center handle
+        if self._edit_tab_id is not None and self._edit_points_abs:
+            pts_local = [QtCore.QPointF(p.x() - gx, p.y() - gy) for p in self._edit_points_abs]
+            path = smooth_closed_path(pts_local)
+            painter.setPen(QtGui.QPen(QtGui.QColor(0, 220, 255, 245), 3))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(0, 220, 255, 70)))
+            painter.drawPath(path)
+
+            for i, p in enumerate(pts_local):
+                painter.setPen(QtGui.QPen(QtGui.QColor(10, 10, 10, 220), 1))
+                painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 200, 0, 240)))
+                painter.drawEllipse(p, self._handle_r, self._handle_r)
+                painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 200)))
+                painter.setFont(QtGui.QFont("Consolas", 9))
+                painter.drawText(p + QtCore.QPointF(12, -12), str(i + 1))
+
+            if self._edit_center_abs is not None:
+                c = QtCore.QPointF(self._edit_center_abs.x() - gx, self._edit_center_abs.y() - gy)
+                painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 240), 2))
+                painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 255, 255, 220)))
+                painter.drawEllipse(c, self._center_r, self._center_r)
+                painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 220)))
+                painter.setFont(QtGui.QFont("Consolas", 10, 900))
+                painter.drawText(c + QtCore.QPointF(-4, 4), "C")
+
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 230)))
+            painter.setFont(QtGui.QFont("Consolas", 14))
+            painter.drawText(20, 40, f"EDIT tab #{self._edit_tab_id} | drag points | drag C=center | ESC/RMB exit")
+
+        # aim point (red)
+        if self._show_point and self._aim_x is not None and self._aim_y is not None:
+            lx = self._aim_x - gx
+            ly = self._aim_y - gy
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 60, 60, 220), 2))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 60, 60, 170)))
+            painter.drawEllipse(QtCore.QPointF(lx, ly), 6, 6)
+
+        if self._show_fps and self._fps is not None:
+            painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 230)))
+            painter.setFont(QtGui.QFont("Consolas", 14))
+            painter.drawText(20, 70, f"FPS: {self._fps:.1f}")
+
+        painter.end()
+
+
+# ============================================================
+# Debug window
+# ============================================================
+class DebugWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Debug")
+        self.resize(1100, 700)
+        self.label = QtWidgets.QLabel("No frames")
+        self.label.setAlignment(QtCore.Qt.AlignCenter)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.label)
+
+    @QtCore.Slot(object)
+    def show_debug(self, payload: dict):
+        frame = payload.get("frame", None)
+        if frame is None:
+            return
+        frame = np.ascontiguousarray(frame)
+        h, w = frame.shape[:2]
+        fmt_bgr = getattr(QtGui.QImage, "Format_BGR888", None)
+        if fmt_bgr is not None:
+            qimg = QtGui.QImage(frame.data, w, h, frame.strides[0], fmt_bgr).copy()
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = np.ascontiguousarray(rgb)
+            qimg = QtGui.QImage(rgb.data, w, h, rgb.strides[0], QtGui.QImage.Format_RGB888).copy()
+        pix = QtGui.QPixmap.fromImage(qimg)
+        self.label.setPixmap(pix.scaled(self.label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+
+
+# ============================================================
+# Threads
+# ============================================================
+class CaptureThread(QtCore.QThread):
+    def __init__(self, settings: Settings, frame_q_detect: queue.Queue, frame_q_watch: queue.Queue):
+        super().__init__()
+        self.settings = settings
+        self.frame_q_detect = frame_q_detect
+        self.frame_q_watch = frame_q_watch
+        self._stop = threading.Event()
+        self._camera = None
+        self._cached_output_idx = None
+
+    def stop(self):
+        self._stop.set()
+
+    def _ensure_camera(self, output_idx: int):
+        if self._camera is not None and self._cached_output_idx == output_idx:
+            return
+        self._camera = None
+        self._cached_output_idx = output_idx
+        try:
+            self._camera = dxcam.create(output_idx=output_idx, output_color="BGR")
+        except TypeError:
+            self._camera = dxcam.create(output_idx=output_idx)
+
+    @staticmethod
+    def _put_latest(q: queue.Queue, payload: dict):
+        try:
+            q.put_nowait(payload)
+        except queue.Full:
+            try:
+                _ = q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                pass
+
+    def run(self):
+        while not self._stop.is_set():
+            s = self.settings.snapshot()
+            if not s["running"] or not s["capture_enabled"]:
+                time.sleep(0.01)
+                continue
+            try:
+                self._ensure_camera(int(s["output_idx"]))
+
+                region = None
+                offset_x = 0
+                offset_y = 0
+
+                if s["capture_mode"] == "window":
+                    hwnd = s["hwnd"]
+                    if hwnd is None:
+                        time.sleep(0.02)
+                        continue
+                    l, t, r, b = get_window_rect(hwnd)
+                    region = (l, t, r, b)
+                    offset_x, offset_y = l, t
+                else:
+                    ml, mt, mr, mb = get_monitor_rect_by_index(int(s["output_idx"]))
+                    offset_x, offset_y = ml, mt
+
+                frame = self._camera.grab(region=region)
+                if frame is None:
+                    time.sleep(0.001)
+                    continue
+                if frame.ndim == 3 and frame.shape[2] == 4:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+                payload = {"frame_bgr": frame, "offset_x": int(offset_x), "offset_y": int(offset_y), "t": time.perf_counter()}
+                self._put_latest(self.frame_q_detect, payload)
+                self._put_latest(self.frame_q_watch, payload)
+            except Exception:
+                time.sleep(0.02)
+
+
+class DetectThread(QtCore.QThread):
+    def __init__(self, settings: Settings, frame_q: queue.Queue, det_q: queue.Queue):
+        super().__init__()
+        self.settings = settings
+        self.frame_q = frame_q
+        self.det_q = det_q
+        self._stop = threading.Event()
+        self.model = None
+        self._last_token = -1
+
+    def stop(self):
+        self._stop.set()
+
+    def _maybe_reload_model(self, s):
+        token = s["_model_reload_token"]
+        if token == self._last_token:
+            return
+        self._last_token = token
+        path = s["model_path"]
+        if not path:
+            self.model = None
+            return
+        try:
+            self.model = YOLO(path)
+        except Exception:
+            self.model = None
+
+    def run(self):
+        while not self._stop.is_set():
+            s = self.settings.snapshot()
+            if not s["running"]:
+                time.sleep(0.01)
+                continue
+            self._maybe_reload_model(s)
+
+            try:
+                item = self.frame_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            frame_bgr = item["frame_bgr"]
+            if self.model is None:
+                out = {**item, "boxes_xyxy": np.zeros((0, 4), np.float32), "boxes_conf": np.zeros((0,), np.float32)}
+                self._put_latest(self.det_q, out)
+                continue
+
+            try:
+                res = self.model.predict(
+                    source=frame_bgr,
+                    imgsz=int(s["imgsz"]),
+                    conf=float(s["conf"]),
+                    device=s["device"],
+                    verbose=False,
+                )[0]
+                if res.boxes is None or len(res.boxes) == 0:
+                    xyxy = np.zeros((0, 4), np.float32)
+                    cfs = np.zeros((0,), np.float32)
+                else:
+                    xyxy = res.boxes.xyxy.detach().cpu().numpy().astype(np.float32)
+                    cfs = res.boxes.conf.detach().cpu().numpy().astype(np.float32)
+                out = {**item, "boxes_xyxy": xyxy, "boxes_conf": cfs}
+                self._put_latest(self.det_q, out)
+            except Exception:
+                continue
+
+    @staticmethod
+    def _put_latest(q: queue.Queue, payload: dict):
+        try:
+            q.put_nowait(payload)
+        except queue.Full:
+            try:
+                _ = q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                pass
+
+
+class CoordsThread(QtCore.QThread):
+    debug_signal = QtCore.Signal(object)
+
+    def __init__(self, settings: Settings, det_q: queue.Queue, point_q: queue.Queue, mouse_q: queue.Queue, shared_target: SharedTargetBuffer):
+        super().__init__()
+        self.settings = settings
+        self.det_q = det_q
+        self.point_q = point_q
+        self.mouse_q = mouse_q
+        self.shared_target = shared_target
+        self._stop = threading.Event()
+        self._last_t = None
+        self._fps_ema = None
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set():
+            s = self.settings.snapshot()
+            if not s["running"]:
+                time.sleep(0.01)
+                continue
+
+            try:
+                item = self.det_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            frame_bgr = item["frame_bgr"]
+            xyxy = item["boxes_xyxy"]
+            cfs = item["boxes_conf"]
+            y_off = int(s["y_offset"])
+            offx = int(item["offset_x"])
+            offy = int(item["offset_y"])
+
+            best = None
+            if xyxy.shape[0] > 0:
+                best = xyxy[int(np.argmax(cfs))]
+
+            target_abs = None
+            aim_abs = None
+            if best is not None:
+                x1, y1, x2, y2 = best
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+                target_abs = (cx + offx, cy + offy)
+                aim_abs = (cx + offx, cy + y_off + offy)
+
+            now = time.perf_counter()
+            fps = None
+            if self._last_t is not None:
+                inst = 1.0 / max(1e-6, now - self._last_t)
+                self._fps_ema = inst if self._fps_ema is None else (0.9 * self._fps_ema + 0.1 * inst)
+                fps = float(self._fps_ema)
+            self._last_t = now
+
+            self.shared_target.update(target_abs=target_abs, aim_abs=aim_abs)
+
+            out = {"aim_abs": aim_abs, "target_abs": target_abs, "fps": fps, "has_target": aim_abs is not None}
+            self._put_latest(self.point_q, out)
+
+            # AIM controlled ONLY by rules
+            aim_active = bool(s["aim_active"]) and (not bool(s["aim_suspended"]))
+            if aim_active:
+                if s["aim_mode"] == "inline":
+                    if aim_abs is not None:
+                        try:
+                            set_cursor_pos(*aim_abs)
+                        except Exception:
+                            pass
+                elif s["aim_mode"] == "thread":
+                    self._put_latest(self.mouse_q, out)
+
+            if s["debug_enabled"]:
+                try:
+                    dbg = frame_bgr.copy()
+                    txt = f"AIM={aim_active}"
+                    if best is not None:
+                        x1, y1, x2, y2 = best.astype(int).tolist()
+                        cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cx = int((x1 + x2) / 2)
+                        cy = int((y1 + y2) / 2)
+                        cv2.circle(dbg, (cx, cy), 6, (255, 200, 0), -1)
+                        cv2.circle(dbg, (cx, cy + y_off), 6, (0, 0, 255), -1)
+                    if fps is not None:
+                        txt += f" FPS~{fps:.1f}"
+                    cv2.putText(dbg, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+                    self.debug_signal.emit({"frame": dbg})
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _put_latest(q: queue.Queue, payload: dict):
+        try:
+            q.put_nowait(payload)
+        except queue.Full:
+            try:
+                _ = q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                pass
+
+
+class OverlayThread(QtCore.QThread):
+    overlay_signal = QtCore.Signal(object)
+
+    def __init__(self, settings: Settings, point_q: queue.Queue):
+        super().__init__()
+        self.settings = settings
+        self.point_q = point_q
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set():
+            s = self.settings.snapshot()
+            if not s["running"]:
+                time.sleep(0.01)
+                continue
+            try:
+                item = self.point_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            show_point = bool(s["overlay_enabled"])
+            show_fps = bool(s["fps_overlay_enabled"])
+
+            x = y = None
+            if item.get("has_target") and item.get("aim_abs") is not None:
+                x, y = item["aim_abs"]
+
+            self.overlay_signal.emit({
+                "x": x, "y": y,
+                "fps": item.get("fps", None),
+                "show_point": show_point,
+                "show_fps": show_fps,
+            })
+
+
+class MouseThread(QtCore.QThread):
+    def __init__(self, settings: Settings, mouse_q: queue.Queue):
+        super().__init__()
+        self.settings = settings
+        self.mouse_q = mouse_q
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                item = self.mouse_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            last = item
+            try:
+                while True:
+                    last = self.mouse_q.get_nowait()
+            except queue.Empty:
+                pass
+
+            s = self.settings.snapshot()
+            if not s["running"]:
+                continue
+            if s["aim_mode"] != "thread":
+                continue
+            if not bool(s["aim_active"]) or bool(s["aim_suspended"]):
+                continue
+
+            aim_abs = last.get("aim_abs", None)
+            if aim_abs is not None:
+                try:
+                    set_cursor_pos(*aim_abs)
+                except Exception:
+                    pass
+
+
+class TemplateWatchThread(QtCore.QThread):
+    status_signal = QtCore.Signal(object)
+    overlay_shapes_signal = QtCore.Signal(object)
+
+    def __init__(self, settings: Settings, store: TemplateStore, shared_frame: SharedFrameBuffer, frame_q_watch: queue.Queue):
+        super().__init__()
+        self.settings = settings
+        self.store = store
+        self.shared_frame = shared_frame
+        self.frame_q_watch = frame_q_watch
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    @staticmethod
+    def _crop(frame_bgr: np.ndarray, roi: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+        x, y, w, h = roi
+        if w <= 0 or h <= 0:
+            return None
+        H, W = frame_bgr.shape[:2]
+        x1 = max(0, min(W, x))
+        y1 = max(0, min(H, y))
+        x2 = max(0, min(W, x + w))
+        y2 = max(0, min(H, y + h))
+        if x2 - x1 <= 0 or y2 - y1 <= 0:
+            return None
+        return frame_bgr[y1:y2, x1:x2]
+
+    def run(self):
+        while not self._stop.is_set():
+            s = self.settings.snapshot()
+            if not s["running"] or not s["capture_enabled"]:
+                time.sleep(0.01)
+                continue
+
+            try:
+                item = self.frame_q_watch.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            frame_bgr = item["frame_bgr"]
+            offx = int(item["offset_x"])
+            offy = int(item["offset_y"])
+            self.shared_frame.update(frame_bgr, offx, offy, float(item["t"]))
+
+            tabs = self.store.snapshot_for_worker()
+            statuses = []
+            shapes_payload = []
+
+            for tab in tabs:
+                tab_id = int(tab["tab_id"])
+                roi_rel = tab["roi_rel"]
+                templ = tab["template_bgr"]
+
+                if roi_rel is None:
+                    statuses.append({"tab_id": tab_id, "has_template": templ is not None, "equal_100": None, "text": "ROI"})
+                else:
+                    crop = self._crop(frame_bgr, roi_rel)
+                    if crop is None:
+                        statuses.append({"tab_id": tab_id, "has_template": templ is not None, "equal_100": None, "text": "ROI"})
+                    else:
+                        if templ is None:
+                            statuses.append({"tab_id": tab_id, "has_template": False, "equal_100": None, "text": "MEM"})
+                        else:
+                            equal = bool(crop.shape == templ.shape and np.array_equal(crop, templ))
+                            statuses.append({"tab_id": tab_id, "has_template": True, "equal_100": equal, "text": "ГОТОВО" if equal else "НЕ ГОТОВО"})
+
+                if tab["overlay_enabled"] and tab["overlay_points_rel"] and len(tab["overlay_points_rel"]) >= 2:
+                    poly_abs = [(int(px + offx), int(py + offy)) for (px, py) in tab["overlay_points_rel"]]
+
+                    center_abs = None
+                    center_rel = tab.get("overlay_center_rel", None)
+                    if center_rel is not None:
+                        center_abs = (int(center_rel[0] + offx), int(center_rel[1] + offy))
+
+                    shapes_payload.append({"tab_id": tab_id, "poly": poly_abs, "center": center_abs})
+
+            self.status_signal.emit({"statuses": statuses})
+            self.overlay_shapes_signal.emit({"shapes": shapes_payload})
+
+
+# ============================================================
+# Template card UI
+# ============================================================
+class TemplateCardWidget(QtWidgets.QFrame):
+    remove_requested = QtCore.Signal(int)
+    edit_overlay_requested = QtCore.Signal(int)
+
+    PREVIEW_SIZE = 92
+    CARD_W = 210
+    CARD_H = 220
+
+    def __init__(self, tab_id: int, store: TemplateStore, settings: Settings, shared_frame: SharedFrameBuffer, parent=None):
+        super().__init__(parent)
+        self.tab_id = tab_id
+        self.store = store
+        self.settings = settings
+        self.shared_frame = shared_frame
+
+        self.setFixedSize(self.CARD_W, self.CARD_H)
+        self._set_border("#333")
+
+        self._btn_style = """
+QToolButton{
+  background:#232323; color:#ddd;
+  border:1px solid #3a3a3a;
+  border-radius:7px;
+  padding:4px 8px;
+}
+QToolButton:hover{ background:#2d2d2d; border-color:#505050; }
+QToolButton:pressed{ background:#1d1d1d; }
+"""
+        self._btn_toggle_style = """
+QToolButton{
+  background:#232323; color:#ddd;
+  border:1px solid #3a3a3a;
+  border-radius:7px;
+  padding:4px 8px;
+}
+QToolButton:hover{ background:#2d2d2d; border-color:#505050; }
+QToolButton:checked{
+  background:rgba(0,220,255,60);
+  border-color:rgba(0,220,255,190);
+  color:#eaffff;
+  font-weight:900;
+}
+"""
+        self._btn_delete_style = """
+QToolButton{
+  background:rgba(231,76,60,60);
+  color:#ffd7d2;
+  border:1px solid rgba(231,76,60,170);
+  border-radius:7px;
+  padding:2px 7px;
+  font-weight:900;
+}
+QToolButton:hover{ background:rgba(231,76,60,95); }
+QToolButton:pressed{ background:rgba(231,76,60,45); }
+"""
+
+        self.lbl_id = QtWidgets.QLabel(f"#{tab_id}")
+        self.lbl_id.setStyleSheet("font-weight:900; color:#ddd;")
+
+        self.key_edit = HotkeyEdit(width=82, placeholder="KEY")
+        self.key_edit.setToolTip("Click -> press key/mouse. Backspace/Delete=clear, Esc=cancel.")
+        self.key_edit.hotkey_changed.connect(self.on_hotkey_changed)
+
+        self.btn_x = QtWidgets.QToolButton()
+        self.btn_x.setText("✕")
+        self.btn_x.setToolTip("Remove")
+        self.btn_x.setStyleSheet(self._btn_delete_style)
+        self.btn_x.setFixedSize(26, 22)
+        self.btn_x.clicked.connect(lambda: self.remove_requested.emit(self.tab_id))
+
+        header = QtWidgets.QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(self.lbl_id)
+        header.addStretch(1)
+        header.addWidget(self.key_edit)
+        header.addWidget(self.btn_x)
+
+        self.lbl_status = QtWidgets.QLabel("ROI")
+        self.lbl_status.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_status.setFixedHeight(28)
+        self.lbl_status.setStyleSheet("font-weight:950; border-radius:8px; background:#2a2a2a; color:#ddd;")
+
+        self.lbl_preview = QtWidgets.QLabel("ROI")
+        self.lbl_preview.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_preview.setFixedSize(self.PREVIEW_SIZE, self.PREVIEW_SIZE)
+        self.lbl_preview.setStyleSheet("background:#0f0f0f; border:1px solid #444; color:#777; border-radius:10px;")
+
+        prev_row = QtWidgets.QHBoxLayout()
+        prev_row.addStretch(1)
+        prev_row.addWidget(self.lbl_preview)
+        prev_row.addStretch(1)
+
+        self.btn_roi = QtWidgets.QToolButton()
+        self.btn_roi.setText("ROI")
+        self.btn_roi.setStyleSheet(self._btn_style)
+        self.btn_roi.clicked.connect(self.on_select_region)
+
+        self.btn_mem = QtWidgets.QToolButton()
+        self.btn_mem.setText("MEM")
+        self.btn_mem.setStyleSheet(self._btn_style)
+        self.btn_mem.clicked.connect(self.on_capture_template)
+
+        self.btn_edit = QtWidgets.QToolButton()
+        self.btn_edit.setText("EDIT")
+        self.btn_edit.setStyleSheet(self._btn_style)
+        self.btn_edit.clicked.connect(lambda: self.edit_overlay_requested.emit(self.tab_id))
+
+        self.btn_ov = QtWidgets.QToolButton()
+        self.btn_ov.setText("OV")
+        self.btn_ov.setCheckable(True)
+        self.btn_ov.setStyleSheet(self._btn_toggle_style)
+        self.btn_ov.toggled.connect(self.on_overlay_toggled)
+
+        btns = QtWidgets.QGridLayout()
+        btns.setHorizontalSpacing(6)
+        btns.setVerticalSpacing(6)
+        btns.addWidget(self.btn_roi, 0, 0)
+        btns.addWidget(self.btn_mem, 0, 1)
+        btns.addWidget(self.btn_edit, 1, 0)
+        btns.addWidget(self.btn_ov, 1, 1)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+        lay.addLayout(header)
+        lay.addWidget(self.lbl_status)
+        lay.addLayout(prev_row)
+        lay.addLayout(btns)
+
+        self.sync_from_store()
+
+    def _set_border(self, color: str):
+        self.setStyleSheet(f"QFrame{{background:#151515; border:2px solid {color}; border-radius:10px;}}")
+
+    def sync_from_store(self):
+        tab = self.store.get_tab_snapshot(self.tab_id)
+        if not tab:
+            return
+        self.btn_ov.blockSignals(True)
+        self.btn_ov.setChecked(bool(tab.get("overlay_enabled", False)))
+        self.btn_ov.blockSignals(False)
+        self.key_edit.blockSignals(True)
+        self.key_edit.setText(tab.get("hotkey_text", "") or "")
+        self.key_edit.blockSignals(False)
+
+    def set_status(self, has_template: bool, equal_100: Optional[bool], text: str):
+        self.sync_from_store()
+
+        if has_template:
+            self.btn_mem.setStyleSheet(self._btn_style + "QToolButton{font-weight:900; border-color:#2ecc71;}")
+        else:
+            self.btn_mem.setStyleSheet(self._btn_style)
+
+        if equal_100 is True:
+            self.lbl_status.setText("ГОТОВО")
+            self.lbl_status.setStyleSheet("font-weight:950; border-radius:8px; background:rgba(46,204,113,70); color:#bfffe1;")
+            self._set_border("#2ecc71")
+        elif equal_100 is False:
+            self.lbl_status.setText("НЕ ГОТОВО")
+            self.lbl_status.setStyleSheet("font-weight:950; border-radius:8px; background:rgba(231,76,60,70); color:#ffd1cc;")
+            self._set_border("#e74c3c")
+        else:
+            self.lbl_status.setText(text if text else "...")
+            self.lbl_status.setStyleSheet("font-weight:950; border-radius:8px; background:#2a2a2a; color:#ddd;")
+            self._set_border("#333")
+
+    def update_live_preview(self, frame_bgr: Optional[np.ndarray]):
+        tab = self.store.get_tab_snapshot(self.tab_id)
+        if tab is None or tab["roi_rel"] is None or frame_bgr is None:
+            self.lbl_preview.setText("ROI")
+            self.lbl_preview.setPixmap(QtGui.QPixmap())
+            return
+
+        x, y, w, h = tab["roi_rel"]
+        H, W = frame_bgr.shape[:2]
+        if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > W or y + h > H:
+            self.lbl_preview.setText("bad")
+            self.lbl_preview.setPixmap(QtGui.QPixmap())
+            return
+
+        crop = frame_bgr[y:y + h, x:x + w]
+        if crop.size == 0:
+            self.lbl_preview.setText("empty")
+            self.lbl_preview.setPixmap(QtGui.QPixmap())
+            return
+
+        crop = np.ascontiguousarray(crop)
+        ch, cw = crop.shape[:2]
+        fmt_bgr = getattr(QtGui.QImage, "Format_BGR888", None)
+        if fmt_bgr is not None:
+            qimg = QtGui.QImage(crop.data, cw, ch, crop.strides[0], fmt_bgr)
+        else:
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            rgb = np.ascontiguousarray(rgb)
+            qimg = QtGui.QImage(rgb.data, cw, ch, rgb.strides[0], QtGui.QImage.Format_RGB888)
+
+        pix = QtGui.QPixmap.fromImage(qimg)
+        self.lbl_preview.setPixmap(pix.scaled(self.lbl_preview.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        self.lbl_preview.setText("")
+
+    def _get_capture_origin_abs(self) -> Tuple[int, int]:
+        s = self.settings.snapshot()
+        if s["capture_mode"] == "window":
+            hwnd = s["hwnd"]
+            if hwnd is None:
+                return (0, 0)
+            l, t, r, b = get_window_rect(hwnd)
+            return (int(l), int(t))
+        else:
+            ml, mt, mr, mb = get_monitor_rect_by_index(int(s["output_idx"]))
+            return (int(ml), int(mt))
+
+    def on_hotkey_changed(self, vk: int, text: str):
+        self.store.set_hotkey(self.tab_id, vk, text)
+
+    def on_select_region(self):
+        dlg = RegionSelectDialog(self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        abs_rect = dlg.abs_rect()
+        if abs_rect is None:
+            return
+        ox, oy = self._get_capture_origin_abs()
+        rel_x = abs_rect.left() - ox
+        rel_y = abs_rect.top() - oy
+        rel_w = abs_rect.width()
+        rel_h = abs_rect.height()
+        self.store.update_roi(self.tab_id, (int(rel_x), int(rel_y), int(rel_w), int(rel_h)))
+
+    def on_capture_template(self):
+        snap = self.shared_frame.snapshot()
+        frame = snap["frame_bgr"]
+        if frame is None:
+            QtWidgets.QMessageBox.warning(self, "No frame", "No frames yet. Start pipeline first.")
+            return
+
+        tab = self.store.get_tab_snapshot(self.tab_id)
+        if tab is None or tab["roi_rel"] is None:
+            QtWidgets.QMessageBox.warning(self, "No ROI", "Select ROI first.")
+            return
+
+        x, y, w, h = tab["roi_rel"]
+        H, W = frame.shape[:2]
+        if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > W or y + h > H:
+            QtWidgets.QMessageBox.warning(self, "Bad ROI", "ROI out of current frame. Re-select ROI.")
+            return
+
+        templ = frame[y:y + h, x:x + w].copy()
+        self.store.set_template(self.tab_id, templ)
+
+    def on_overlay_toggled(self, checked: bool):
+        self.store.set_overlay_enabled(self.tab_id, bool(checked))
+
+
+# ============================================================
+# Rule editor UI
+# ============================================================
+class RuleEditorDialog(QtWidgets.QDialog):
+    def __init__(self, ruleset: RuleSet, template_store: TemplateStore, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Rule editor #{ruleset.rule_id}")
+        self.resize(1100, 680)
+
+        self._ruleset = ruleset
+        self._template_store = template_store
+        self._updating = False
+
+        self.ed_name = QtWidgets.QLineEdit(ruleset.name)
+        self.cb_enabled = QtWidgets.QCheckBox("Enabled")
+        self.cb_enabled.setChecked(bool(ruleset.enabled))
+
+        self.bind_edit = HotkeyEdit(width=160, placeholder="BIND")
+        self.bind_edit.setText(ruleset.bind_text or "")
+        self.bind_edit.hotkey_changed.connect(self.on_bind_changed)
+
+        self.cb_aim = QtWidgets.QCheckBox("Aim enabled while holding rule BIND")
+        self.cb_aim.setChecked(bool(ruleset.aim_enabled_on_bind_hold))
+
+        self.cb_all_ready = QtWidgets.QCheckBox("Require ALL referenced cards READY (ГОТОВО) before running steps")
+        self.cb_all_ready.setChecked(bool(ruleset.require_all_ready))
+
+        top = QtWidgets.QGridLayout()
+        top.addWidget(QtWidgets.QLabel("Name:"), 0, 0)
+        top.addWidget(self.ed_name, 0, 1, 1, 3)
+        top.addWidget(self.cb_enabled, 1, 0)
+        top.addWidget(QtWidgets.QLabel("Bind:"), 1, 1)
+        top.addWidget(self.bind_edit, 1, 2)
+        top.addWidget(self.cb_aim, 2, 0, 1, 4)
+        top.addWidget(self.cb_all_ready, 3, 0, 1, 4)
+
+        self.list_steps = QtWidgets.QListWidget()
+        self.list_steps.currentRowChanged.connect(self.on_step_selected)
+
+        self.btn_add = QtWidgets.QPushButton("+ Step")
+        self.btn_del = QtWidgets.QPushButton("Delete")
+        self.btn_up = QtWidgets.QPushButton("Up")
+        self.btn_dn = QtWidgets.QPushButton("Down")
+
+        self.btn_add.clicked.connect(self.on_add_step)
+        self.btn_del.clicked.connect(self.on_del_step)
+        self.btn_up.clicked.connect(lambda: self._move(-1))
+        self.btn_dn.clicked.connect(lambda: self._move(+1))
+
+        left_btns = QtWidgets.QHBoxLayout()
+        left_btns.addWidget(self.btn_add)
+        left_btns.addWidget(self.btn_del)
+        left_btns.addStretch(1)
+        left_btns.addWidget(self.btn_up)
+        left_btns.addWidget(self.btn_dn)
+
+        left = QtWidgets.QWidget()
+        ll = QtWidgets.QVBoxLayout(left)
+        ll.addWidget(QtWidgets.QLabel("Steps:"))
+        ll.addWidget(self.list_steps)
+        ll.addLayout(left_btns)
+
+        self.grp = QtWidgets.QGroupBox("Selected step")
+        form = QtWidgets.QFormLayout(self.grp)
+
+        self.cmb_card = QtWidgets.QComboBox()
+        self._refresh_cards_combo()
+        self.cmb_card.currentIndexChanged.connect(self.on_step_changed)
+
+        self.cmb_action = QtWidgets.QComboBox()
+        self.cmb_action.addItem("Press selected card KEY", "press_card_key")
+        self.cmb_action.addItem("Move cursor to EDGE of this overlay (ray C->AIM)", "move_cursor_to_edge")
+        self.cmb_action.currentIndexChanged.connect(self.on_step_changed)
+
+        self.cb_need_inside = QtWidgets.QCheckBox("Condition: AIM point must be INSIDE this overlay to continue")
+        self.cb_need_inside.stateChanged.connect(self.on_step_changed)
+
+        self.cb_outside_wait = QtWidgets.QCheckBox("If AIM OUTSIDE: press KEY and wait until AIM enters overlay")
+        self.cb_outside_wait.stateChanged.connect(self.on_step_changed)
+
+        self.hk_outside_key = HotkeyEdit(width=100, placeholder="S")
+        self.hk_outside_key.setText("S")
+        self.hk_outside_key.hotkey_changed.connect(self.on_outside_key_changed)
+
+        self.sp_outside_poll = QtWidgets.QSpinBox()
+        self.sp_outside_poll.setRange(1, 1000)
+        self.sp_outside_poll.setSuffix(" ms")
+        self.sp_outside_poll.setValue(30)
+        self.sp_outside_poll.valueChanged.connect(self.on_step_changed)
+
+        self.sp_outside_timeout = QtWidgets.QSpinBox()
+        self.sp_outside_timeout.setRange(0, 600000)
+        self.sp_outside_timeout.setSuffix(" ms")
+        self.sp_outside_timeout.setValue(0)
+        self.sp_outside_timeout.valueChanged.connect(self.on_step_changed)
+
+        self.cb_disable_aim = QtWidgets.QCheckBox("Disable aim on this step")
+        self.cb_disable_aim.stateChanged.connect(self.on_step_changed)
+
+        self.sp_delay = QtWidgets.QSpinBox()
+        self.sp_delay.setRange(0, 600000)
+        self.sp_delay.setSuffix(" ms")
+        self.sp_delay.valueChanged.connect(self.on_step_changed)
+
+        # repeat if moved
+        self.cb_repeat_moved = QtWidgets.QCheckBox("If AIM moved > threshold -> press KEY and repeat THIS step")
+        self.cb_repeat_moved.stateChanged.connect(self.on_step_changed)
+
+        self.sp_move_thr = QtWidgets.QSpinBox()
+        self.sp_move_thr.setRange(0, 5000)
+        self.sp_move_thr.setSuffix(" px")
+        self.sp_move_thr.setValue(10)
+        self.sp_move_thr.valueChanged.connect(self.on_step_changed)
+
+        self.hk_repeat_key = HotkeyEdit(width=100, placeholder="S")
+        self.hk_repeat_key.setText("S")
+        self.hk_repeat_key.hotkey_changed.connect(self.on_repeat_key_changed)
+
+        self.sp_repeat_max = QtWidgets.QSpinBox()
+        self.sp_repeat_max.setRange(1, 1000)
+        self.sp_repeat_max.setValue(30)
+        self.sp_repeat_max.valueChanged.connect(self.on_step_changed)
+
+        self.ed_comment = QtWidgets.QLineEdit()
+        self.ed_comment.setPlaceholderText("Comment")
+        self.ed_comment.textChanged.connect(self.on_step_changed)
+
+        form.addRow("Card:", self.cmb_card)
+        form.addRow("Action:", self.cmb_action)
+        form.addRow("", self.cb_need_inside)
+        form.addRow("", self.cb_outside_wait)
+        form.addRow("Outside KEY:", self.hk_outside_key)
+        form.addRow("Outside poll:", self.sp_outside_poll)
+        form.addRow("Outside timeout:", self.sp_outside_timeout)
+        form.addRow("", self.cb_disable_aim)
+        form.addRow("Delay after step:", self.sp_delay)
+
+        form.addRow("", QtWidgets.QLabel("— Repeat if AIM moved —"))
+        form.addRow("", self.cb_repeat_moved)
+        form.addRow("Move threshold:", self.sp_move_thr)
+        form.addRow("Repeat KEY:", self.hk_repeat_key)
+        form.addRow("Max repeats:", self.sp_repeat_max)
+
+        form.addRow("Comment:", self.ed_comment)
+
+        split = QtWidgets.QSplitter()
+        split.addWidget(left)
+        split.addWidget(self.grp)
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(top)
+        layout.addWidget(split)
+        layout.addWidget(buttons)
+
+        self._refresh_steps_list()
+        if self._ruleset.steps:
+            self.list_steps.setCurrentRow(0)
+        else:
+            self.grp.setEnabled(False)
+
+    def _refresh_cards_combo(self):
+        self.cmb_card.blockSignals(True)
+        self.cmb_card.clear()
+        tabs = self._template_store.list_tabs_snapshot()
+        if not tabs:
+            self.cmb_card.addItem("(no cards)", None)
+        else:
+            for t in tabs:
+                tid = int(t["tab_id"])
+                keytxt = t.get("hotkey_text", "") or "-"
+                self.cmb_card.addItem(f"#{tid}  KEY={keytxt}", tid)
+        self.cmb_card.blockSignals(False)
+
+    def _refresh_steps_list(self):
+        self.list_steps.clear()
+        for i, s in enumerate(self._ruleset.steps, start=1):
+            a = s.action
+            tid = s.template_tab_id
+            cond = " [need INSIDE]" if s.require_target_inside_overlay else ""
+            wait = " [outside->wait]" if (s.require_target_inside_overlay and s.press_key_if_outside_and_wait) else ""
+            aimoff = " [aim OFF]" if s.disable_aim_on_step else ""
+            d = f" delay={int(s.delay_ms_after)}ms" if int(s.delay_ms_after) > 0 else ""
+            rep = ""
+            if s.repeat_if_aim_moved:
+                rep = f" [repeat if move>{int(s.aim_move_threshold_px)}px key={s.repeat_key_text} max={int(s.repeat_max_times)}]"
+            c = f" | {s.comment}" if s.comment else ""
+            self.list_steps.addItem(f"{i}. tab={tid} action={a}{cond}{wait}{aimoff}{d}{rep}{c}")
+
+    def on_bind_changed(self, vk: int, text: str):
+        self._ruleset.bind_vk = int(vk or 0)
+        self._ruleset.bind_text = str(text or "")
+
+    def on_add_step(self):
+        self._refresh_cards_combo()
+        tab_id = self.cmb_card.currentData()
+        self._ruleset.steps.append(RuleStep(template_tab_id=tab_id))
+        self._refresh_steps_list()
+        self.list_steps.setCurrentRow(self.list_steps.count() - 1)
+
+    def on_del_step(self):
+        row = self.list_steps.currentRow()
+        if row < 0:
+            return
+        self._ruleset.steps.pop(row)
+        self._refresh_steps_list()
+        if self._ruleset.steps:
+            self.list_steps.setCurrentRow(min(row, len(self._ruleset.steps) - 1))
+        else:
+            self.grp.setEnabled(False)
+
+    def _move(self, d: int):
+        row = self.list_steps.currentRow()
+        if row < 0:
+            return
+        nr = row + d
+        if not (0 <= nr < len(self._ruleset.steps)):
+            return
+        self._ruleset.steps[row], self._ruleset.steps[nr] = self._ruleset.steps[nr], self._ruleset.steps[row]
+        self._refresh_steps_list()
+        self.list_steps.setCurrentRow(nr)
+
+    def on_outside_key_changed(self, vk: int, text: str):
+        if self._updating:
+            return
+        row = self.list_steps.currentRow()
+        if row < 0 or row >= len(self._ruleset.steps):
+            return
+        s = self._ruleset.steps[row]
+        s.outside_key_vk = int(vk or 0)
+        s.outside_key_text = str(text or "")
+        self._refresh_steps_list()
+        self.list_steps.setCurrentRow(row)
+
+    def on_repeat_key_changed(self, vk: int, text: str):
+        if self._updating:
+            return
+        row = self.list_steps.currentRow()
+        if row < 0 or row >= len(self._ruleset.steps):
+            return
+        s = self._ruleset.steps[row]
+        s.repeat_key_vk = int(vk or 0)
+        s.repeat_key_text = str(text or "")
+        self._refresh_steps_list()
+        self.list_steps.setCurrentRow(row)
+
+    def on_step_selected(self, row: int):
+        if row < 0 or row >= len(self._ruleset.steps):
+            self.grp.setEnabled(False)
+            return
+        self.grp.setEnabled(True)
+
+        self._updating = True
+        try:
+            self._refresh_cards_combo()
+            s = self._ruleset.steps[row]
+
+            idx = self.cmb_card.findData(s.template_tab_id)
+            self.cmb_card.setCurrentIndex(idx if idx >= 0 else 0)
+
+            idxa = self.cmb_action.findData(s.action)
+            self.cmb_action.setCurrentIndex(idxa if idxa >= 0 else 0)
+
+            self.cb_need_inside.setChecked(bool(s.require_target_inside_overlay))
+            self.cb_outside_wait.setChecked(bool(s.press_key_if_outside_and_wait))
+            self.hk_outside_key.setText(str(s.outside_key_text or "S"))
+            self.sp_outside_poll.setValue(int(s.outside_poll_ms))
+            self.sp_outside_timeout.setValue(int(s.outside_timeout_ms))
+
+            self.cb_disable_aim.setChecked(bool(s.disable_aim_on_step))
+            self.sp_delay.setValue(int(s.delay_ms_after))
+
+            self.cb_repeat_moved.setChecked(bool(s.repeat_if_aim_moved))
+            self.sp_move_thr.setValue(int(s.aim_move_threshold_px))
+            self.hk_repeat_key.setText(str(s.repeat_key_text or "S"))
+            self.sp_repeat_max.setValue(int(s.repeat_max_times))
+
+            self.ed_comment.setText(s.comment or "")
+        finally:
+            self._updating = False
+
+    def on_step_changed(self, *args):
+        if self._updating:
+            return
+        row = self.list_steps.currentRow()
+        if row < 0 or row >= len(self._ruleset.steps):
+            return
+        s = self._ruleset.steps[row]
+        s.template_tab_id = self.cmb_card.currentData()
+        s.action = str(self.cmb_action.currentData() or "press_card_key")
+
+        s.require_target_inside_overlay = self.cb_need_inside.isChecked()
+        s.press_key_if_outside_and_wait = self.cb_outside_wait.isChecked()
+        s.outside_poll_ms = int(self.sp_outside_poll.value())
+        s.outside_timeout_ms = int(self.sp_outside_timeout.value())
+
+        s.disable_aim_on_step = self.cb_disable_aim.isChecked()
+        s.delay_ms_after = int(self.sp_delay.value())
+
+        s.repeat_if_aim_moved = self.cb_repeat_moved.isChecked()
+        s.aim_move_threshold_px = int(self.sp_move_thr.value())
+        s.repeat_max_times = int(self.sp_repeat_max.value())
+
+        s.comment = self.ed_comment.text()
+
+        self._refresh_steps_list()
+        self.list_steps.setCurrentRow(row)
+
+    def ruleset(self) -> RuleSet:
+        return self._ruleset
+
+    def accept(self):
+        self._ruleset.name = self.ed_name.text().strip() or self._ruleset.name
+        self._ruleset.enabled = self.cb_enabled.isChecked()
+        self._ruleset.aim_enabled_on_bind_hold = self.cb_aim.isChecked()
+        self._ruleset.require_all_ready = self.cb_all_ready.isChecked()
+        super().accept()
+
+
+# ============================================================
+# Config encode/decode helpers
+# ============================================================
+def bgr_to_png_b64(img_bgr: np.ndarray) -> str:
+    ok, buf = cv2.imencode(".png", img_bgr)
+    if not ok:
+        return ""
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def png_b64_to_bgr(s: str) -> Optional[np.ndarray]:
+    if not s:
+        return None
+    try:
+        raw = base64.b64decode(s.encode("ascii"))
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return img
+    except Exception:
+        return None
+
+
+# ============================================================
+# Main UI
+# ============================================================
+class MainWindow(QtWidgets.QMainWindow):
+    MAX_TABS = 200
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("DXCAM + YOLO + Templates + Rules + Monitor + Config")
+
+        self.settings = Settings()
+        self.template_store = TemplateStore()
+        self.shared_frame = SharedFrameBuffer()
+        self.shared_target = SharedTargetBuffer()
+        self.rules_store = RulesStore()
+        self.monitor = RuleMonitor()
+
+        # runtime readiness map
+        self._tab_ready: Dict[int, Optional[bool]] = {}
+
+        # queues
+        self.frame_q_detect = queue.Queue(maxsize=1)
+        self.frame_q_watch = queue.Queue(maxsize=1)
+        self.det_q = queue.Queue(maxsize=1)
+        self.point_q = queue.Queue(maxsize=1)
+        self.mouse_q = queue.Queue(maxsize=1)
+
+        # windows
+        self.overlay = OverlayWindow(self.settings, self.template_store, self.shared_frame)
+        self.debug_window = DebugWindow()
+        self.debug_window.show()
+
+        # threads
+        self.t_capture = CaptureThread(self.settings, self.frame_q_detect, self.frame_q_watch)
+        self.t_detect = DetectThread(self.settings, self.frame_q_detect, self.det_q)
+        self.t_coords = CoordsThread(self.settings, self.det_q, self.point_q, self.mouse_q, self.shared_target)
+        self.t_overlay = OverlayThread(self.settings, self.point_q)
+        self.t_mouse = MouseThread(self.settings, self.mouse_q)
+        self.t_watch = TemplateWatchThread(self.settings, self.template_store, self.shared_frame, self.frame_q_watch)
+
+        self.t_coords.debug_signal.connect(self.on_debug_frame)
+        self.t_overlay.overlay_signal.connect(self.overlay.update_state)
+        self.t_watch.status_signal.connect(self.on_template_statuses)
+        self.t_watch.overlay_shapes_signal.connect(self.overlay.update_state)
+
+        # UI
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QGridLayout(central)
+        row = 0
+
+        # Start/Stop
+        self.btn_start = QtWidgets.QPushButton("Start")
+        self.btn_stop = QtWidgets.QPushButton("Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_start.clicked.connect(self.start_pipeline)
+        self.btn_stop.clicked.connect(self.stop_pipeline)
+        layout.addWidget(self.btn_start, row, 0)
+        layout.addWidget(self.btn_stop, row, 1)
+
+        # Config
+        self.btn_save_cfg = QtWidgets.QPushButton("Save config...")
+        self.btn_load_cfg = QtWidgets.QPushButton("Load config...")
+        self.btn_save_cfg.clicked.connect(self.save_config_dialog)
+        self.btn_load_cfg.clicked.connect(self.load_config_dialog)
+        layout.addWidget(self.btn_save_cfg, row, 2)
+        layout.addWidget(self.btn_load_cfg, row, 3)
+        row += 1
+
+        # Model
+        self.btn_load = QtWidgets.QPushButton("Load model .pt")
+        self.btn_load.clicked.connect(self.load_model)
+        self.lbl_model = QtWidgets.QLabel("Model: (none)")
+        layout.addWidget(self.btn_load, row, 0)
+        layout.addWidget(self.lbl_model, row, 1, 1, 3)
+        row += 1
+
+        # Capture mode
+        self.rb_screen = QtWidgets.QRadioButton("Capture screen")
+        self.rb_window = QtWidgets.QRadioButton("Capture window")
+        self.rb_screen.setChecked(True)
+        self.rb_screen.toggled.connect(self.apply_capture_mode)
+        self.rb_window.toggled.connect(self.apply_capture_mode)
+        layout.addWidget(self.rb_screen, row, 0)
+        layout.addWidget(self.rb_window, row, 1)
+        row += 1
+
+        # Bind window
+        self.ed_title = QtWidgets.QLineEdit()
+        self.ed_title.setPlaceholderText("Window title (exact)")
+        self.btn_bind = QtWidgets.QPushButton("Bind window")
+        self.btn_bind.clicked.connect(self.bind_window)
+        layout.addWidget(self.ed_title, row, 0, 1, 2)
+        layout.addWidget(self.btn_bind, row, 2)
+        row += 1
+
+        # Toggles
+        self.cb_capture = QtWidgets.QCheckBox("Enable capture")
+        self.cb_capture.setChecked(True)
+        self.cb_overlay = QtWidgets.QCheckBox("Overlay point")
+        self.cb_overlay.setChecked(True)
+        self.cb_fps = QtWidgets.QCheckBox("FPS overlay")
+        self.cb_fps.setChecked(True)
+        self.cb_debug = QtWidgets.QCheckBox("Debug window")
+        self.cb_debug.setChecked(True)
+
+        self.cb_capture.stateChanged.connect(self.apply_toggles)
+        self.cb_overlay.stateChanged.connect(self.apply_toggles)
+        self.cb_fps.stateChanged.connect(self.apply_toggles)
+        self.cb_debug.stateChanged.connect(self.apply_toggles)
+
+        layout.addWidget(self.cb_capture, row, 0)
+        layout.addWidget(self.cb_overlay, row, 1)
+        layout.addWidget(self.cb_fps, row, 2)
+        layout.addWidget(self.cb_debug, row, 3)
+        row += 1
+
+        # Aim engine mode
+        self.cmb_aim = QtWidgets.QComboBox()
+        self.cmb_aim.addItems(["Aim engine: OFF", "Aim engine: Inline", "Aim engine: Threaded"])
+        self.cmb_aim.currentIndexChanged.connect(self.apply_toggles)
+        layout.addWidget(self.cmb_aim, row, 0, 1, 2)
+        row += 1
+
+        # Rules block
+        self.grp_rules = QtWidgets.QGroupBox("Rules")
+        vr = QtWidgets.QVBoxLayout(self.grp_rules)
+
+        self.rules_list = QtWidgets.QTreeWidget()
+        self.rules_list.setHeaderLabels(["ID", "Name", "Bind", "AimOnHold", "AllReady", "Steps", "Enabled"])
+        self.rules_list.setRootIsDecorated(False)
+        self.rules_list.setAlternatingRowColors(True)
+
+        btns = QtWidgets.QHBoxLayout()
+        self.btn_rule_add = QtWidgets.QPushButton("+ Add rule")
+        self.btn_rule_edit = QtWidgets.QPushButton("Edit")
+        self.btn_rule_del = QtWidgets.QPushButton("Delete")
+        btns.addWidget(self.btn_rule_add)
+        btns.addWidget(self.btn_rule_edit)
+        btns.addWidget(self.btn_rule_del)
+        btns.addStretch(1)
+
+        self.btn_rule_add.clicked.connect(self.add_rule)
+        self.btn_rule_edit.clicked.connect(self.edit_rule)
+        self.btn_rule_del.clicked.connect(self.delete_rule)
+
+        vr.addWidget(self.rules_list)
+        vr.addLayout(btns)
+        layout.addWidget(self.grp_rules, row, 0, 1, 4)
+        row += 1
+
+        # Rule monitor block (optional)
+        self.grp_monitor = QtWidgets.QGroupBox("Rule monitor (optional)")
+        vm = QtWidgets.QVBoxLayout(self.grp_monitor)
+
+        topm = QtWidgets.QHBoxLayout()
+        self.cb_monitor = QtWidgets.QCheckBox("Enable")
+        self.cb_monitor.stateChanged.connect(self.on_monitor_toggle)
+        topm.addWidget(self.cb_monitor)
+        topm.addStretch(1)
+
+        self.lbl_mon_rule = QtWidgets.QLabel("Rule: -")
+        self.lbl_mon_phase = QtWidgets.QLabel("Phase: -")
+        self.lbl_mon_step = QtWidgets.QLabel("Step: -")
+        self.lbl_mon_missing = QtWidgets.QLabel("Missing: -")
+        self.lbl_mon_done = QtWidgets.QLabel("Done: -")
+        self.lbl_mon_msg = QtWidgets.QLabel("Message: -")
+        for lbl in (self.lbl_mon_rule, self.lbl_mon_phase, self.lbl_mon_step, self.lbl_mon_missing, self.lbl_mon_done, self.lbl_mon_msg):
+            lbl.setWordWrap(True)
+
+        vm.addLayout(topm)
+        vm.addWidget(self.lbl_mon_rule)
+        vm.addWidget(self.lbl_mon_phase)
+        vm.addWidget(self.lbl_mon_step)
+        vm.addWidget(self.lbl_mon_missing)
+        vm.addWidget(self.lbl_mon_done)
+        vm.addWidget(self.lbl_mon_msg)
+
+        layout.addWidget(self.grp_monitor, row, 0, 1, 4)
+        row += 1
+
+        # Sliders
+        self.sl_imgsz = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sl_imgsz.setRange(320, 1920)
+        self.sl_imgsz.setSingleStep(32)
+        self.sl_imgsz.setValue(1280)
+        self.sl_imgsz.valueChanged.connect(self.on_imgsz_changed)
+        self.lbl_imgsz = QtWidgets.QLabel("imgsz: 1280")
+        layout.addWidget(self.lbl_imgsz, row, 0)
+        layout.addWidget(self.sl_imgsz, row, 1, 1, 3)
+        row += 1
+
+        self.sl_conf = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sl_conf.setRange(1, 100)
+        self.sl_conf.setValue(25)
+        self.sl_conf.valueChanged.connect(self.on_conf_changed)
+        self.lbl_conf = QtWidgets.QLabel("conf: 0.25")
+        layout.addWidget(self.lbl_conf, row, 0)
+        layout.addWidget(self.sl_conf, row, 1, 1, 3)
+        row += 1
+
+        self.sp_yoff = QtWidgets.QSpinBox()
+        self.sp_yoff.setRange(-500, 500)
+        self.sp_yoff.setValue(40)
+        self.sp_yoff.valueChanged.connect(self.on_yoff_changed)
+        layout.addWidget(QtWidgets.QLabel("Y offset (px):"), row, 0)
+        layout.addWidget(self.sp_yoff, row, 1)
+        row += 1
+
+        # Cards block
+        self.grp_templates = QtWidgets.QGroupBox("Templates (cards)")
+        v = QtWidgets.QVBoxLayout(self.grp_templates)
+
+        hbtn = QtWidgets.QHBoxLayout()
+        self.btn_add_card = QtWidgets.QPushButton("+ Add card")
+        self.btn_add_card.clicked.connect(self.add_card)
+        hbtn.addWidget(self.btn_add_card)
+        hbtn.addStretch(1)
+        v.addLayout(hbtn)
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        self.cards_container = QtWidgets.QWidget()
+        self.flow = FlowLayout(self.cards_container, margin=10, hspacing=10, vspacing=10)
+        self.cards_container.setLayout(self.flow)
+        self.scroll.setWidget(self.cards_container)
+        v.addWidget(self.scroll)
+
+        layout.addWidget(self.grp_templates, row, 0, 1, 4)
+        row += 1
+
+        self.lbl_status = QtWidgets.QLabel("Status: idle")
+        layout.addWidget(self.lbl_status, row, 0, 1, 4)
+
+        self.resize(1320, 1200)
+
+        # runtime UI
+        self.card_by_id: Dict[int, TemplateCardWidget] = {}
+        self._rule_last_down: Dict[int, bool] = {}
+
+        # init
+        self.add_card()
+        self.rules_store.add("Rule 1")
+        self.refresh_rules()
+
+        # preview timer
+        self.preview_timer = QtCore.QTimer(self)
+        self.preview_timer.setInterval(100)
+        self.preview_timer.timeout.connect(self.update_all_previews)
+        self.preview_timer.start()
+
+        # rules polling
+        self.rules_timer = QtCore.QTimer(self)
+        self.rules_timer.setInterval(20)
+        self.rules_timer.timeout.connect(self.poll_rules)
+        self.rules_timer.start()
+
+        # monitor refresh timer (runs only when enabled)
+        self.mon_timer = QtCore.QTimer(self)
+        self.mon_timer.setInterval(60)
+        self.mon_timer.timeout.connect(self.refresh_monitor_ui)
+
+        self.apply_toggles()
+        self.apply_capture_mode()
+        self.on_imgsz_changed(self.sl_imgsz.value())
+        self.on_conf_changed(self.sl_conf.value())
+        self.on_yoff_changed(self.sp_yoff.value())
+
+    # ------------------ Monitor UI
+    def on_monitor_toggle(self, st: int):
+        enabled = self.cb_monitor.isChecked()
+        self.monitor.set_enabled(enabled)
+        if enabled:
+            self.mon_timer.start()
+        else:
+            self.mon_timer.stop()
+            self.refresh_monitor_ui()
+
+    def refresh_monitor_ui(self):
+        st = self.monitor.snapshot()
+        if not self.cb_monitor.isChecked() or not st.active:
+            self.lbl_mon_rule.setText("Rule: -")
+            self.lbl_mon_phase.setText("Phase: -")
+            self.lbl_mon_step.setText("Step: -")
+            self.lbl_mon_missing.setText("Missing: -")
+            self.lbl_mon_done.setText("Done: -")
+            self.lbl_mon_msg.setText("Message: -")
+            return
+
+        self.lbl_mon_rule.setText(f"Rule: #{st.rule_id} {st.rule_name}")
+        self.lbl_mon_phase.setText(f"Phase: {st.phase}")
+        self.lbl_mon_step.setText(f"Step: {st.step_index}/{st.steps_total}")
+        self.lbl_mon_missing.setText(f"Missing: {st.missing or '-'}")
+        self.lbl_mon_done.setText(f"Done: {st.done or '-'}")
+        self.lbl_mon_msg.setText(f"Message: {st.message or '-'}")
+
+    # ------------------ Cards UI
+    def add_card(self):
+        tab_id = self.template_store.add_tab()
+        card = TemplateCardWidget(tab_id, self.template_store, self.settings, self.shared_frame, parent=self.cards_container)
+        card.remove_requested.connect(self.remove_card)
+        card.edit_overlay_requested.connect(lambda tid: self.overlay.toggle_edit(int(tid)))
+        self.flow.addWidget(card)
+        self.card_by_id[tab_id] = card
+        card.show()
+        self.flow.invalidate()
+        self.cards_container.adjustSize()
+
+    def remove_card(self, tab_id: int):
+        w = self.card_by_id.pop(tab_id, None)
+        if w:
+            self.template_store.remove_tab(tab_id)
+            w.setParent(None)
+            w.deleteLater()
+            self.flow.invalidate()
+            self.cards_container.adjustSize()
+
+    def update_all_previews(self):
+        snap = self.shared_frame.snapshot()
+        frame = snap["frame_bgr"]
+        for c in self.card_by_id.values():
+            c.update_live_preview(frame)
+
+    def clear_cards_ui(self):
+        for _, w in list(self.card_by_id.items()):
+            w.setParent(None)
+            w.deleteLater()
+        self.card_by_id.clear()
+        while True:
+            it = self.flow.takeAt(0)
+            if it is None:
+                break
+
+    def rebuild_cards_ui_from_store(self):
+        self.clear_cards_ui()
+        tabs = self.template_store.snapshot_for_worker()
+        for t in tabs:
+            tab_id = int(t["tab_id"])
+            card = TemplateCardWidget(tab_id, self.template_store, self.settings, self.shared_frame, parent=self.cards_container)
+            card.remove_requested.connect(self.remove_card)
+            card.edit_overlay_requested.connect(lambda tid: self.overlay.toggle_edit(int(tid)))
+            self.flow.addWidget(card)
+            self.card_by_id[tab_id] = card
+            card.show()
+        self.flow.invalidate()
+        self.cards_container.adjustSize()
+
+    # ------------------ Rules UI
+    def refresh_rules(self):
+        self.rules_list.clear()
+        for r in self.rules_store.list_snapshot():
+            it = QtWidgets.QTreeWidgetItem([
+                str(r["rule_id"]),
+                r["name"],
+                r.get("bind_text", "") or "",
+                "yes" if r["aim_on_hold"] else "no",
+                "yes" if r["all_ready"] else "no",
+                str(r["steps"]),
+                "yes" if r["enabled"] else "no",
+            ])
+            it.setData(0, QtCore.Qt.UserRole, int(r["rule_id"]))
+            self.rules_list.addTopLevelItem(it)
+        for i in range(7):
+            self.rules_list.resizeColumnToContents(i)
+
+    def _selected_rule_id(self) -> Optional[int]:
+        it = self.rules_list.currentItem()
+        if not it:
+            return None
+        return int(it.data(0, QtCore.Qt.UserRole))
+
+    def add_rule(self):
+        self.rules_store.add()
+        self.refresh_rules()
+
+    def edit_rule(self):
+        rid = self._selected_rule_id()
+        if rid is None:
+            return
+        rs = self.rules_store.get_copy(rid)
+        if rs is None:
+            return
+        dlg = RuleEditorDialog(rs, template_store=self.template_store, parent=self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self.rules_store.save(dlg.ruleset())
+            self.refresh_rules()
+
+    def delete_rule(self):
+        rid = self._selected_rule_id()
+        if rid is None:
+            return
+        self.rules_store.remove(rid)
+        self.refresh_rules()
+
+    # ------------------ Runtime: overlay path for a tab (ABS)
+    def _tab_overlay_path_abs(self, tab_id: int) -> Tuple[Optional[QtGui.QPainterPath], Optional[QtCore.QPointF]]:
+        tab = self.template_store.get_tab_snapshot(int(tab_id))
+        if not tab:
+            return None, None
+
+        pts_rel = tab.get("overlay_points_rel", None)
+        if not pts_rel or len(pts_rel) < 2:
+            return None, None
+
+        snap = self.shared_frame.snapshot()
+        offx = int(snap["offset_x"])
+        offy = int(snap["offset_y"])
+
+        pts_abs = [QtCore.QPointF(float(px + offx), float(py + offy)) for (px, py) in pts_rel]
+        path = smooth_closed_path(pts_abs)
+
+        c_rel = tab.get("overlay_center_rel", None)
+        if c_rel is not None:
+            center = QtCore.QPointF(float(c_rel[0] + offx), float(c_rel[1] + offy))
+        else:
+            cx = float(sum(p.x() for p in pts_abs) / len(pts_abs))
+            cy = float(sum(p.y() for p in pts_abs) / len(pts_abs))
+            center = QtCore.QPointF(cx, cy)
+
+        return path, center
+
+    def _is_aim_inside_overlay(self, tab_id: int) -> bool:
+        st = self.shared_target.snapshot()
+        aim_abs = st.get("aim_abs", None)
+        if aim_abs is None:
+            return False
+        aim_pt = QtCore.QPointF(float(aim_abs[0]), float(aim_abs[1]))
+
+        path, center = self._tab_overlay_path_abs(int(tab_id))
+        if path is None:
+            return False
+        return path_contains_point(path, aim_pt, center)
+
+    def _wait_aim_inside_overlay(self, tab_id: int, step: RuleStep) -> bool:
+        if self._is_aim_inside_overlay(tab_id):
+            return True
+
+        if step.press_key_if_outside_and_wait:
+            send_press_by_vk(int(step.outside_key_vk or 0x53))
+
+        poll_ms = int(step.outside_poll_ms)
+        timeout_ms = int(step.outside_timeout_ms)
+        t0 = time.perf_counter()
+
+        if self.cb_monitor.isChecked():
+            self.monitor.update(
+                active=True,
+                phase="WAIT_INSIDE",
+                message=f"Waiting AIM inside overlay of tab #{tab_id}",
+                missing=f"AIM inside overlay #{tab_id}",
+            )
+
+        while True:
+            if self._is_aim_inside_overlay(tab_id):
+                return True
+
+            if timeout_ms > 0 and (time.perf_counter() - t0) * 1000.0 >= timeout_ms:
+                return False
+
+            time.sleep(max(1, poll_ms) / 1000.0)
+
+    # ------------------ Rules runtime
+    def poll_rules(self):
+        """
+        1) aim_active = True если есть правило с aim_on_hold и bind удерживается.
+        2) шаги исполняются по edge (нажатие бинда).
+        """
+        rules = self.rules_store.snapshot_for_runtime()
+
+        any_aim = False
+        for r in rules:
+            if not r.enabled:
+                continue
+            if int(r.bind_vk or 0) == 0:
+                continue
+            if not r.aim_enabled_on_bind_hold:
+                continue
+            if is_vk_down(int(r.bind_vk)):
+                any_aim = True
+                break
+
+        with self.settings.lock:
+            self.settings.aim_active = bool(any_aim) and (not bool(self.settings.aim_suspended))
+
+        for r in rules:
+            rid = int(r.rule_id)
+            vk = int(r.bind_vk or 0)
+            if (not r.enabled) or vk == 0:
+                self._rule_last_down[rid] = False
+                continue
+
+            down = is_vk_down(vk)
+            last = bool(self._rule_last_down.get(rid, False))
+            self._rule_last_down[rid] = down
+
+            if down and not last:
+                threading.Thread(target=self._execute_rule, args=(r,), daemon=True).start()
+
+    def _execute_rule(self, r: RuleSet):
+        steps_total = len(r.steps)
+        if self.cb_monitor.isChecked():
+            self.monitor.update(
+                active=True,
+                rule_id=int(r.rule_id),
+                rule_name=str(r.name),
+                phase="START",
+                step_index=0,
+                steps_total=steps_total,
+                message="Triggered",
+                missing="",
+                done="",
+            )
+
+        # condition: all ready for referenced cards
+        if r.require_all_ready:
+            not_ready = []
+            for s in r.steps:
+                if s.template_tab_id is None:
+                    continue
+                if self._tab_ready.get(int(s.template_tab_id), None) is not True:
+                    not_ready.append(int(s.template_tab_id))
+            if not_ready:
+                if self.cb_monitor.isChecked():
+                    self.monitor.update(
+                        active=True,
+                        phase="ABORT",
+                        message="AllReady condition failed",
+                        missing=f"Tabs not READY: {not_ready}",
+                        done="",
+                    )
+                return
+
+        for idx, step in enumerate(r.steps, start=1):
+            tid = step.template_tab_id
+            if tid is None:
+                continue
+
+            if self.cb_monitor.isChecked():
+                self.monitor.update(
+                    active=True,
+                    phase="STEP",
+                    step_index=idx,
+                    steps_total=steps_total,
+                    message=f"Step {idx}: tab #{tid} action={step.action}",
+                    missing="",
+                    done=f"Completed steps: {idx-1}",
+                )
+
+            # repeat loop if aim moved
+            rep_i = 0
+            prev_aim = self.shared_target.snapshot().get("aim_abs", None)
+
+            while True:
+                # step condition: AIM inside this overlay
+                if step.require_target_inside_overlay:
+                    ok = self._wait_aim_inside_overlay(int(tid), step)
+                    if not ok:
+                        if self.cb_monitor.isChecked():
+                            self.monitor.update(
+                                active=True,
+                                phase="ABORT",
+                                message="Timeout while waiting AIM inside",
+                                missing=f"AIM inside overlay #{tid}",
+                                done=f"Completed steps: {idx-1}",
+                            )
+                        return
+
+                with self.settings.lock:
+                    self.settings.aim_suspended = bool(step.disable_aim_on_step)
+
+                try:
+                    # ACTION
+                    if step.action == "press_card_key":
+                        tab = self.template_store.get_tab_snapshot(int(tid))
+                        if tab:
+                            vk = int(tab.get("hotkey_vk", 0) or 0)
+                            if vk != 0:
+                                send_press_by_vk(vk)
+
+                    elif step.action == "move_cursor_to_edge":
+                        st = self.shared_target.snapshot()
+                        aim_abs = st.get("aim_abs", None)
+                        if aim_abs is None:
+                            break
+                        aim_pt = QtCore.QPointF(float(aim_abs[0]), float(aim_abs[1]))
+
+                        path, center = self._tab_overlay_path_abs(int(tid))
+                        if path is None or center is None:
+                            break
+
+                        edge = edge_point_on_ray(path, center, aim_pt)
+                        if edge is not None:
+                            try:
+                                set_cursor_pos(int(edge.x()), int(edge.y()))
+                            except Exception:
+                                pass
+
+                    # delay AFTER step
+                    dms = int(step.delay_ms_after or 0)
+                    if dms > 0:
+                        time.sleep(dms / 1000.0)
+
+                finally:
+                    with self.settings.lock:
+                        self.settings.aim_suspended = False
+
+                # ---- Repeat if AIM moved
+                if not step.repeat_if_aim_moved:
+                    break
+
+                cur_aim = self.shared_target.snapshot().get("aim_abs", None)
+                if prev_aim is None or cur_aim is None:
+                    break
+
+                dist = math.hypot(float(cur_aim[0] - prev_aim[0]), float(cur_aim[1] - prev_aim[1]))
+                if dist <= float(step.aim_move_threshold_px):
+                    break
+
+                # moved -> press repeat key and repeat this step
+                if self.cb_monitor.isChecked():
+                    self.monitor.update(
+                        active=True,
+                        phase="REPEAT",
+                        message=f"AIM moved {dist:.1f}px > {step.aim_move_threshold_px}px -> press {step.repeat_key_text} and repeat",
+                        missing="AIM stable",
+                        done=f"Completed steps: {idx-1}",
+                    )
+
+                send_press_by_vk(int(step.repeat_key_vk or 0x53))
+                time.sleep(0.02)
+
+                prev_aim = cur_aim
+                rep_i += 1
+                if rep_i >= int(step.repeat_max_times):
+                    break
+
+        if self.cb_monitor.isChecked():
+            self.monitor.update(
+                active=True,
+                phase="DONE",
+                message="Rule finished",
+                missing="",
+                done=f"Completed steps: {steps_total}",
+            )
+
+    # ------------------ Pipeline
+    def start_pipeline(self):
+        with self.settings.lock:
+            self.settings.running = True
+
+        for t in (self.t_capture, self.t_detect, self.t_coords, self.t_overlay, self.t_mouse, self.t_watch):
+            if not t.isRunning():
+                t.start()
+
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.lbl_status.setText("Status: running")
+
+    def stop_pipeline(self):
+        with self.settings.lock:
+            self.settings.running = False
+            self.settings.aim_active = False
+            self.settings.aim_suspended = False
+
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.lbl_status.setText("Status: stopped")
+        self.overlay.update_state({"x": None, "y": None, "fps": None, "show_point": False, "show_fps": False, "shapes": []})
+
+    def closeEvent(self, event):
+        for t in (self.t_capture, self.t_detect, self.t_coords, self.t_overlay, self.t_mouse, self.t_watch):
+            t.stop()
+        for t in (self.t_capture, self.t_detect, self.t_coords, self.t_overlay, self.t_mouse, self.t_watch):
+            t.wait(1000)
+
+        self.overlay.close()
+        self.debug_window.close()
+        super().closeEvent(event)
+
+    # ------------------ Settings UI
+    def load_model(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select YOLO .pt", "", "YOLO model (*.pt)")
+        if not path:
+            return
+        self.settings.request_model_reload(path)
+        self.lbl_model.setText(f"Model: {path}")
+
+    def apply_capture_mode(self):
+        mode = "screen" if self.rb_screen.isChecked() else "window"
+        with self.settings.lock:
+            self.settings.capture_mode = mode
+
+    def bind_window(self):
+        title = self.ed_title.text().strip()
+        if not title:
+            return
+        try:
+            hwnd = find_window_by_title(title)
+        except Exception:
+            hwnd = None
+        with self.settings.lock:
+            self.settings.window_title = title
+            self.settings.hwnd = hwnd
+        self.lbl_status.setText("Status: window bound" if hwnd else "Status: window not found")
+
+    def apply_toggles(self):
+        idx = self.cmb_aim.currentIndex()
+        aim_mode = "off" if idx == 0 else ("inline" if idx == 1 else "thread")
+
+        with self.settings.lock:
+            self.settings.capture_enabled = self.cb_capture.isChecked()
+            self.settings.overlay_enabled = self.cb_overlay.isChecked()
+            self.settings.fps_overlay_enabled = self.cb_fps.isChecked()
+            self.settings.debug_enabled = self.cb_debug.isChecked()
+            self.settings.aim_mode = aim_mode
+
+        if self.cb_debug.isChecked():
+            self.debug_window.show()
+        else:
+            self.debug_window.hide()
+
+    def on_imgsz_changed(self, v: int):
+        v32 = max(320, min(1920, int(round(v / 32) * 32)))
+        if v32 != v:
+            self.sl_imgsz.blockSignals(True)
+            self.sl_imgsz.setValue(v32)
+            self.sl_imgsz.blockSignals(False)
+        with self.settings.lock:
+            self.settings.imgsz = v32
+        self.lbl_imgsz.setText(f"imgsz: {v32}")
+
+    def on_conf_changed(self, v: int):
+        conf = float(v) / 100.0
+        with self.settings.lock:
+            self.settings.conf = conf
+        self.lbl_conf.setText(f"conf: {conf:.2f}")
+
+    def on_yoff_changed(self, v: int):
+        with self.settings.lock:
+            self.settings.y_offset = int(v)
+
+    # ------------------ Signals
+    @QtCore.Slot(object)
+    def on_debug_frame(self, payload: dict):
+        if self.cb_debug.isChecked():
+            self.debug_window.show_debug(payload)
+
+    @QtCore.Slot(object)
+    def on_template_statuses(self, payload: dict):
+        statuses = payload.get("statuses", []) or []
+        mp = {int(s["tab_id"]): s for s in statuses}
+
+        for tid, st in mp.items():
+            self._tab_ready[int(tid)] = st.get("equal_100", None)
+
+        for tab_id, card in self.card_by_id.items():
+            st = mp.get(tab_id)
+            if not st:
+                continue
+            card.set_status(st.get("has_template", False), st.get("equal_100", None), st.get("text", ""))
+
+    # ============================================================
+    # CONFIG SAVE / LOAD
+    # ============================================================
+    def _configs_dir(self) -> str:
+        d = os.path.join(os.getcwd(), "configs")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def export_config(self) -> dict:
+        s = self.settings.snapshot()
+
+        settings_data = {
+            "capture_enabled": bool(s["capture_enabled"]),
+            "capture_mode": s["capture_mode"],
+            "window_title": s["window_title"],
+            "output_idx": int(s["output_idx"]),
+            "imgsz": int(s["imgsz"]),
+            "conf": float(s["conf"]),
+            "y_offset": int(s["y_offset"]),
+            "overlay_enabled": bool(s["overlay_enabled"]),
+            "fps_overlay_enabled": bool(s["fps_overlay_enabled"]),
+            "debug_enabled": bool(s["debug_enabled"]),
+            "aim_mode": s["aim_mode"],
+            "device": s["device"],
+            "model_path": s["model_path"],
+        }
+
+        templates_out = []
+        for t in self.template_store.snapshot_for_worker():
+            templ_png = ""
+            if t.get("template_bgr") is not None:
+                try:
+                    templ_png = bgr_to_png_b64(t["template_bgr"])
+                except Exception:
+                    templ_png = ""
+
+            center = t.get("overlay_center_rel", None)
+            center_out = [float(center[0]), float(center[1])] if center is not None else None
+
+            templates_out.append({
+                "tab_id": int(t["tab_id"]),
+                "name": str(t.get("name", "")),
+                "hotkey_vk": int(t.get("hotkey_vk", 0) or 0),
+                "hotkey_text": str(t.get("hotkey_text", "")),
+                "roi_rel": list(t["roi_rel"]) if t.get("roi_rel") is not None else None,
+                "template_png_b64": templ_png,
+                "overlay_enabled": bool(t.get("overlay_enabled", False)),
+                "overlay_points_rel": [[float(x), float(y)] for (x, y) in (t.get("overlay_points_rel") or [])] if t.get("overlay_points_rel") else None,
+                "overlay_center_rel": center_out,
+            })
+
+        rules_out = []
+        for r in self.rules_store.snapshot_for_runtime():
+            rules_out.append({
+                "rule_id": int(r.rule_id),
+                "name": str(r.name),
+                "enabled": bool(r.enabled),
+                "bind_vk": int(r.bind_vk or 0),
+                "bind_text": str(r.bind_text or ""),
+                "aim_enabled_on_bind_hold": bool(r.aim_enabled_on_bind_hold),
+                "require_all_ready": bool(r.require_all_ready),
+                "steps": [
+                    {
+                        "template_tab_id": (int(s2.template_tab_id) if s2.template_tab_id is not None else None),
+                        "action": str(s2.action),
+                        "require_target_inside_overlay": bool(s2.require_target_inside_overlay),
+                        "press_key_if_outside_and_wait": bool(s2.press_key_if_outside_and_wait),
+                        "outside_key_vk": int(s2.outside_key_vk),
+                        "outside_key_text": str(s2.outside_key_text),
+                        "outside_poll_ms": int(s2.outside_poll_ms),
+                        "outside_timeout_ms": int(s2.outside_timeout_ms),
+                        "disable_aim_on_step": bool(s2.disable_aim_on_step),
+                        "delay_ms_after": int(s2.delay_ms_after),
+                        "repeat_if_aim_moved": bool(s2.repeat_if_aim_moved),
+                        "aim_move_threshold_px": int(s2.aim_move_threshold_px),
+                        "repeat_key_vk": int(s2.repeat_key_vk),
+                        "repeat_key_text": str(s2.repeat_key_text),
+                        "repeat_max_times": int(s2.repeat_max_times),
+                        "comment": str(s2.comment or ""),
+                    }
+                    for s2 in r.steps
+                ],
+            })
+
+        return {"version": 3, "settings": settings_data, "templates": templates_out, "rules": rules_out}
+
+    def apply_config(self, cfg: dict):
+        self.stop_pipeline()
+
+        settings_data = cfg.get("settings", {}) or {}
+        templates_data = cfg.get("templates", []) or []
+        rules_data = cfg.get("rules", []) or []
+
+        with self.settings.lock:
+            self.settings.capture_enabled = bool(settings_data.get("capture_enabled", True))
+            self.settings.capture_mode = str(settings_data.get("capture_mode", "screen"))
+            self.settings.window_title = str(settings_data.get("window_title", ""))
+            self.settings.output_idx = int(settings_data.get("output_idx", 0))
+            self.settings.imgsz = int(settings_data.get("imgsz", 1280))
+            self.settings.conf = float(settings_data.get("conf", 0.25))
+            self.settings.y_offset = int(settings_data.get("y_offset", 40))
+            self.settings.overlay_enabled = bool(settings_data.get("overlay_enabled", True))
+            self.settings.fps_overlay_enabled = bool(settings_data.get("fps_overlay_enabled", True))
+            self.settings.debug_enabled = bool(settings_data.get("debug_enabled", True))
+            self.settings.aim_mode = str(settings_data.get("aim_mode", "off"))
+            self.settings.device = str(settings_data.get("device", "0"))
+
+            mp = settings_data.get("model_path", None)
+            self.settings.model_path = str(mp) if mp else None
+            self.settings._model_reload_token += 1
+
+            if self.settings.capture_mode == "window" and self.settings.window_title:
+                try:
+                    self.settings.hwnd = find_window_by_title(self.settings.window_title)
+                except Exception:
+                    self.settings.hwnd = None
+            else:
+                self.settings.hwnd = None
+
+            self.settings.aim_active = False
+            self.settings.aim_suspended = False
+
+        # UI sync
+        self.cb_capture.setChecked(bool(settings_data.get("capture_enabled", True)))
+        self.cb_overlay.setChecked(bool(settings_data.get("overlay_enabled", True)))
+        self.cb_fps.setChecked(bool(settings_data.get("fps_overlay_enabled", True)))
+        self.cb_debug.setChecked(bool(settings_data.get("debug_enabled", True)))
+
+        self.rb_screen.setChecked(str(settings_data.get("capture_mode", "screen")) == "screen")
+        self.rb_window.setChecked(str(settings_data.get("capture_mode", "screen")) == "window")
+        self.ed_title.setText(str(settings_data.get("window_title", "")))
+
+        aim_mode = str(settings_data.get("aim_mode", "off"))
+        self.cmb_aim.blockSignals(True)
+        self.cmb_aim.setCurrentIndex(0 if aim_mode == "off" else (1 if aim_mode == "inline" else 2))
+        self.cmb_aim.blockSignals(False)
+
+        self.sl_imgsz.setValue(int(settings_data.get("imgsz", 1280)))
+        self.sl_conf.setValue(int(float(settings_data.get("conf", 0.25)) * 100))
+        self.sp_yoff.setValue(int(settings_data.get("y_offset", 40)))
+
+        self.lbl_model.setText(f"Model: {settings_data.get('model_path') or '(none)'}")
+
+        # templates
+        tabs: List[TemplateTabData] = []
+        for t in templates_data:
+            tab_id = int(t.get("tab_id", 0))
+            if tab_id <= 0:
+                continue
+
+            roi = t.get("roi_rel", None)
+            roi_rel = tuple(int(x) for x in roi) if (isinstance(roi, list) and len(roi) == 4) else None
+
+            templ_bgr = None
+            templ_png = str(t.get("template_png_b64", "") or "")
+            if templ_png:
+                templ_bgr = png_b64_to_bgr(templ_png)
+
+            pts = t.get("overlay_points_rel", None)
+            overlay_pts = None
+            if isinstance(pts, list) and pts:
+                overlay_pts = [(float(p[0]), float(p[1])) for p in pts if isinstance(p, list) and len(p) == 2]
+
+            c = t.get("overlay_center_rel", None)
+            center_rel = None
+            if isinstance(c, list) and len(c) == 2:
+                center_rel = (float(c[0]), float(c[1]))
+
+            tabs.append(TemplateTabData(
+                tab_id=tab_id,
+                name=str(t.get("name", "") or f"{tab_id}"),
+                hotkey_vk=int(t.get("hotkey_vk", 0) or 0),
+                hotkey_text=str(t.get("hotkey_text", "") or ""),
+                roi_rel=roi_rel,
+                template_bgr=templ_bgr,
+                overlay_enabled=bool(t.get("overlay_enabled", False)),
+                overlay_points_rel=overlay_pts,
+                overlay_center_rel=center_rel,
+            ))
+
+        self.template_store.clear_and_load(tabs)
+        self.rebuild_cards_ui_from_store()
+
+        # rules
+        rules: List[RuleSet] = []
+        for r in rules_data:
+            rid = int(r.get("rule_id", 0))
+            if rid <= 0:
+                continue
+            steps_in = r.get("steps", []) or []
+            steps: List[RuleStep] = []
+            for s2 in steps_in:
+                steps.append(RuleStep(
+                    template_tab_id=(int(s2["template_tab_id"]) if s2.get("template_tab_id", None) is not None else None),
+                    action=str(s2.get("action", "press_card_key")),
+                    require_target_inside_overlay=bool(s2.get("require_target_inside_overlay", False)),
+                    press_key_if_outside_and_wait=bool(s2.get("press_key_if_outside_and_wait", True)),
+                    outside_key_vk=int(s2.get("outside_key_vk", 0x53)),
+                    outside_key_text=str(s2.get("outside_key_text", "S")),
+                    outside_poll_ms=int(s2.get("outside_poll_ms", 30)),
+                    outside_timeout_ms=int(s2.get("outside_timeout_ms", 0)),
+                    disable_aim_on_step=bool(s2.get("disable_aim_on_step", False)),
+                    delay_ms_after=int(s2.get("delay_ms_after", 0)),
+                    repeat_if_aim_moved=bool(s2.get("repeat_if_aim_moved", False)),
+                    aim_move_threshold_px=int(s2.get("aim_move_threshold_px", 10)),
+                    repeat_key_vk=int(s2.get("repeat_key_vk", 0x53)),
+                    repeat_key_text=str(s2.get("repeat_key_text", "S")),
+                    repeat_max_times=int(s2.get("repeat_max_times", 30)),
+                    comment=str(s2.get("comment", "") or ""),
+                ))
+            rules.append(RuleSet(
+                rule_id=rid,
+                name=str(r.get("name", f"Rule {rid}")),
+                enabled=bool(r.get("enabled", True)),
+                bind_vk=int(r.get("bind_vk", 0) or 0),
+                bind_text=str(r.get("bind_text", "") or ""),
+                aim_enabled_on_bind_hold=bool(r.get("aim_enabled_on_bind_hold", False)),
+                require_all_ready=bool(r.get("require_all_ready", False)),
+                steps=steps,
+            ))
+
+        self.rules_store.clear_and_load(rules)
+        self._rule_last_down.clear()
+        self.refresh_rules()
+
+        self.apply_toggles()
+        self.apply_capture_mode()
+        self.lbl_status.setText("Status: config loaded (pipeline stopped)")
+
+    def save_config_dialog(self):
+        cfg_dir = self._configs_dir()
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save config", os.path.join(cfg_dir, "config.json"), "Config (*.json)")
+        if not path:
+            return
+        try:
+            cfg = self.export_config()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            self.lbl_status.setText(f"Status: config saved -> {path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save error", str(e))
+
+    def load_config_dialog(self):
+        cfg_dir = self._configs_dir()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load config", cfg_dir, "Config (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.apply_config(cfg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load error", str(e))
+
+
+# ============================================================
+# main
+# ============================================================
+def main():
+    enable_dpi_awareness()
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
